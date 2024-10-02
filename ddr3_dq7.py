@@ -3,6 +3,8 @@ Hardware setup:
 
 Laptop with a single 1GB DDR3 SODIMM, with a ~10CM "antenna" wire soldered to the DQ7 line
 
+(I'm not sure if it matters but I also have a 15 ohm resistor at the point where the antenna connects)
+
 When I click the button on a regular piezo-electric cigarette lighter, a small EMP
 is generated, which is picked up by the antenna. Running memtest shows several
 bitflips occur each time (depending on the distance) and the flip *always* affects
