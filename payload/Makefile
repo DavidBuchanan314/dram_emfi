@@ -1,4 +1,7 @@
-all: gimme_shell
+all: payload_elf.h
 
-gimme_shell: gimme_shell.c
-	gcc gimme_shell.c -o gimme_shell -Os -s -ffreestanding -nostdlib -N
+payload_elf.h: gimme_shell.elf
+	xxd -n payload_elf -i $< $@
+
+gimme_shell.elf: gimme_shell.c
+	gcc $< -o $@ -Os -s -ffreestanding -nostdlib -N -static
