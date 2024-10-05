@@ -26,7 +26,7 @@ access to a page table from userspace.
 // TODO: size this dynamically based on /proc/meminfo
 #define PT_SPRAY_COUNT 0x2000
 
-// this must be greater than PT_SPRAY_COUNT!
+// this must not be greater than PT_SPRAY_COUNT!
 #define TLB_FLUSH_ITERS 2048
 
 // needs to be at least 2MiB aligned
