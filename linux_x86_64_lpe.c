@@ -213,5 +213,7 @@ int main()
 	}
 
 	printf("[+] About to get root?\n");
-	system("su"); // TODO: execve
+
+	execve(TARGET_BIN, (char *[]){TARGET_BIN, NULL}, NULL);
+	perror("execve");
 }
