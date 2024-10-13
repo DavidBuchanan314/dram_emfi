@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta charset="UTF-8">
+		<title>alignment prober</title>
+	</head>
+	<body>
+		<canvas id="canvas"></canvas>
+		<script type="text/javascript">
+			function shuffleArray(array) {
+				for (let i = array.length - 1; i >= 0; i--) {
+					const j = Math.floor(Math.random() * (i + 1));
+					[array[i], array[j]] = [array[j], array[i]];
+				}
+			}
+
+			const ALLOC_SIZE = 512 * 0x100000; // 512MiB, exceed cache by some margin
+			const MAX_DETECTABLE_CACHE_LINE_SIZE = 256; // in bytes
+
+			const ab = new ArrayBuffer(ALLOC_SIZE + 8); // we're going to assume this is at least 8-byte aligned, for efficient acces of 64-bit values.
+			const ab32 = new Uint32Array(ab);
+
+			const num_groups = MAX_DETECTABLE_CACHE_LINE_SIZE / 8; // each "lane" is 8 bytes wide
+			const num_steps = ALLOC_SIZE / 8 / num_groups;
+			let permutation = Array.from(Array(num_steps).keys()); // https://stackoverflow.com/a/33352604
+			shuffleArray(permutation);
+			permutation.push(permutation[0]);
+
+			// fill in the big array
+			for (let i=0; i<num_steps; i++) {
+				let a = permutation[i];
+				let b = permutation[i+1];
+				for (let j=0; j<num_groups; j++) {
+					ab32[(a * num_groups + j) * 2] = b;
+				}
+			}
+
+			console.log("starting");
+
+			function microbench(offset, steps) {
+				let start = performance.now();
+
+				let ptr = permutation[0];
+				for (let i=0; i<steps; i++) {
+					let x = (ptr * num_groups + offset) * 2;
+					ptr = ab32[x + ab32[x + 3]];
+				}
+
+				return performance.now() - start;
+			}
+
+			// maybe warm up the JIT
+			for (let i=0; i<1000; i++) {
+				microbench(0, 100);
+			}
+
+			let results = [];
+
+			for (let offset=0; offset < num_groups; offset++) {
+				let duration = microbench(offset, num_steps/8);
+				results.push(duration);
+				console.log(offset, duration);
+			}
+
+			// plot results
+			const WIDTH = 640;
+			const HEIGHT = 480;
+			const c = document.getElementById("canvas");
+			c.width = WIDTH;
+			c.height = HEIGHT;
+			const ctx = c.getContext("2d");
+
+			ctx.fillStyle = "#fff";
+			ctx.fillRect(0, 0, c.width, c.height);
+			
+			let graph_top = Math.max(...results) * 1.1;
+
+			for (let i = 0; i < num_groups; i++) {
+				ctx.strokeRect(
+					c.width / num_groups * i,
+					c.height - 1 - results[i] / graph_top * c.height,
+					c.width / num_groups,
+					c.height - 1
+				);
+			}
+
+		</script>
+	</body>
+</html>
