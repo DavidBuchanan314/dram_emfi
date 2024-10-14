@@ -8,9 +8,10 @@
 		<canvas id="canvas"></canvas>
 		<script type="text/javascript" src="util.js"></script>
 		<script type="text/javascript" src="cache_line_probe.js"></script>
+		<script type="text/javascript" src="page_probe.js"></script>
 		<script type="text/javascript" src="graph.js"></script>
 		<script type="text/javascript">
-			const ALLOC_SIZE = 4 * 0x100000; // allocation size, will be larger once we get to 4KiB probing
+			const ALLOC_SIZE = 16 * 0x100000; // allocation size, will be larger once we get to 4KiB probing
 			const ab = new ArrayBuffer(ALLOC_SIZE); // we're going to assume this is at least 8-byte aligned, for efficient acces of 64-bit values.
 
 			const CACHE_LINE_SEARCH_SIZE = 2 * 0x100000; // exceed L1 but not necessarily L2/L3
@@ -33,11 +34,11 @@
 					p.innerText = msg;
 					document.body.appendChild(p);
 
-					const ab32_cache_aligned = new Uint32Array(ab, cache_line_offset, Math.floor((CACHE_LINE_SEARCH_SIZE - cache_line_offset) / Uint32Array.BYTES_PER_ELEMENT + 3));
-					cache_line_probe(
+					const ab32_cache_aligned = new Uint32Array(ab, cache_line_offset, Math.floor((ALLOC_SIZE - cache_line_offset) / Uint32Array.BYTES_PER_ELEMENT));
+					page_probe(
 						ab32_cache_aligned,
 						(wip_results_y, wip_results_x) => {
-							plot_graph(c, wip_results_y, wip_results_x);
+							plot_graph(c, wip_results_y, null);
 						},
 						(cache_line_offset, cache_line_size_bytes, err) => {
 							let msg;

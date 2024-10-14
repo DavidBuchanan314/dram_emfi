@@ -1,10 +1,9 @@
-function cache_line_probe(ab32, progress_cb, done_cb)
+function page_probe(ab32, progress_cb, done_cb)
 {
-	//const CACHE_LINE_SEARCH_SIZE = 2 * 0x100000; // exceed L1 but not necessarily L2/L3
-	const MAX_DETECTABLE_CACHE_LINE_SIZE = 256; // in bytes
+	const MAX_DETECTABLE_CACHE_LINE_SIZE = 4096 * 8; // in bytes
 
-	const num_groups = MAX_DETECTABLE_CACHE_LINE_SIZE / 8; // each "lane" is 8 bytes wide
-	const num_steps = Math.floor((ab32.byteLength - 3*4) / 8 / num_groups);
+	const num_groups = MAX_DETECTABLE_CACHE_LINE_SIZE / 64; // each "lane" is 64 bytes wide
+	const num_steps = Math.floor((ab32.byteLength - (16 + 1)*4) / 64 / num_groups);
 	let permutation = Array.from(Array(num_steps).keys()); // https://stackoverflow.com/a/33352604
 	shuffleArray(permutation);
 	permutation.push(permutation[0]);
@@ -14,8 +13,8 @@ function cache_line_probe(ab32, progress_cb, done_cb)
 		let a = permutation[i];
 		let b = permutation[i+1];
 		for (let j=0; j<num_groups; j++) {
-			ab32[(a * num_groups + j) * 2 + 0] = b;
-			ab32[(a * num_groups + j) * 2 + 1] = 0;
+			ab32[(a * num_groups + j) * 8 * 2 + 0] = b;
+			ab32[(a * num_groups + j) * 8 * 2 + 1] = 0;
 		}
 	}
 
@@ -26,8 +25,8 @@ function cache_line_probe(ab32, progress_cb, done_cb)
 
 		let ptr = 0;
 		for (let i=0; i<steps; i++) {
-			let x = (ptr * num_groups + offset) * 2;
-			ptr = ab32[x + ab32[x + 3]];
+			let x = (ptr * num_groups + offset) * 8 * 2;
+			ptr = ab32[x + ab32[x + 8 * 2 + 1]]; // always two cache lines but sometimes two pages
 		}
 
 		return performance.now() - start;
@@ -45,7 +44,7 @@ function cache_line_probe(ab32, progress_cb, done_cb)
 		if(offset >= num_groups) {
 			repeats += 1;
 			offset = 0;
-			if (repeats > 3) {
+			if (repeats > 2) {
 				//alert("done");
 				let res = process_cache_line_search_results();
 				if (typeof res === "string") {
@@ -62,7 +61,7 @@ function cache_line_probe(ab32, progress_cb, done_cb)
 		//console.log(offset, duration);
 
 		//plot_graph(c, results);
-		progress_cb(results, Array.from(results.keys()).map(x=>x*8));
+		progress_cb(results, Array.from(results.keys()).map(x=>x*8*8));
 
 		setTimeout(()=>bench_step(repeats, offset+1), 0); // yield
 	}
@@ -85,9 +84,9 @@ function cache_line_probe(ab32, progress_cb, done_cb)
 				return "Error: Failed to determine cache line size!";
 			}
 		}
-		const cache_line_size_bytes = spacing * 8;
+		const cache_line_size_bytes = spacing * 8 * 8;
 		console.log(slow_result_indices, spacing);
-		const cache_line_offset = ((slow_result_indices[0] + 1) % spacing) * 8; // XXX: probably wrong lol
+		const cache_line_offset = ((slow_result_indices[0] + 1) % spacing) * 8 * 8; // XXX: probably wrong lol
 		console.log(cache_line_offset);
 		return [cache_line_offset, cache_line_size_bytes];
 		/*msg = "Detected cache line size: " + cache_line_size_bytes + " bytes."
