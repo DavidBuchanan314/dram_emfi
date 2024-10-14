@@ -6,146 +6,54 @@
 	</head>
 	<body>
 		<canvas id="canvas"></canvas>
+		<script type="text/javascript" src="util.js"></script>
+		<script type="text/javascript" src="cache_line_probe.js"></script>
+		<script type="text/javascript" src="graph.js"></script>
 		<script type="text/javascript">
-			function shuffleArray(array) {
-				for (let i = array.length - 1; i >= 0; i--) {
-					const j = Math.floor(Math.random() * (i + 1));
-					[array[i], array[j]] = [array[j], array[i]];
-				}
-			}
-
-			const ALLOC_SIZE = 4 * 0x100000;
-			const CACHE_LINE_SEARCH_SIZE = 2 * 0x100000; // exceed L1 but not necessarily L2/L3
-			const MAX_DETECTABLE_CACHE_LINE_SIZE = 256; // in bytes
-
+			const ALLOC_SIZE = 4 * 0x100000; // allocation size, will be larger once we get to 4KiB probing
 			const ab = new ArrayBuffer(ALLOC_SIZE); // we're going to assume this is at least 8-byte aligned, for efficient acces of 64-bit values.
 
+			const CACHE_LINE_SEARCH_SIZE = 2 * 0x100000; // exceed L1 but not necessarily L2/L3
 			const ab32 = new Uint32Array(ab, 0, CACHE_LINE_SEARCH_SIZE / Uint32Array.BYTES_PER_ELEMENT + 3);
 
-			const num_groups = MAX_DETECTABLE_CACHE_LINE_SIZE / 8; // each "lane" is 8 bytes wide
-			const num_steps = CACHE_LINE_SEARCH_SIZE / 8 / num_groups;
-			let permutation = Array.from(Array(num_steps).keys()); // https://stackoverflow.com/a/33352604
-			shuffleArray(permutation);
-			permutation.push(permutation[0]);
-
-			// fill in the big array
-			for (let i=0; i<num_steps; i++) {
-				let a = permutation[i];
-				let b = permutation[i+1];
-				for (let j=0; j<num_groups; j++) {
-					ab32[(a * num_groups + j) * 2] = b;
-				}
-			}
-
-			console.log("starting");
-
-			function microbench(offset, steps) {
-				let start = performance.now();
-
-				let ptr = permutation[0];
-				for (let i=0; i<steps; i++) {
-					let x = (ptr * num_groups + offset) * 2;
-					ptr = ab32[x + ab32[x + 3]];
-				}
-
-				return performance.now() - start;
-			}
-
-			// maybe warm up the JIT
-			//for (let i=0; i<1000; i++) {
-			//	microbench(0, 100);
-			//}
-
-			let results = new Array(num_groups).fill(0);
-
-			function bench_step(repeats, offset)
-			{
-				if(offset >= num_groups) {
-					repeats += 1;
-					offset = 0;
-					if (repeats > 5) {
-						//alert("done");
-						process_cache_line_search_results();
-						return;
-					}
-				};
-				let duration = microbench(offset, num_steps*128);
-				//results.push(duration);
-				results[offset] = results[offset] == 0 ? duration : Math.min(results[offset], duration);
-				//console.log(offset, duration);
-
-				redraw();
-
-				setTimeout(()=>bench_step(repeats, offset+1), 0); // yield
-			}
-
-			function process_cache_line_search_results()
-			{
-				const threshold = (Math.min(...results) + Math.max(...results)) / 2;
-				let slow_result_indices = [];
-				for (let i in results) {
-					if (results[i] > threshold) {
-						slow_result_indices.push(1);
-					}
-				}
-				if (slow_result_indices.length & (slow_result_indices.length - 1)) { // if not a power of 2
-					console.log("Error: Failed to determine cache line size!");
-					return;
-				}
-				let spacing = results.length / slow_result_indices.length;
-				for (let i of slow_result_indices) {
-					if ((i % spacing) != (slow_result_indices[0] % spacing)) {
-						console.log("Error: Failed to determine cache line size!");
-						return;
-					}
-				}
-				let cache_line_size_bytes = spacing * 8;
-				msg = "Detected cache line size: " + cache_line_size_bytes + " bytes."
-				console.log(msg);
-				let p = document.createElement("p");
-				p.innerText = msg;
-				document.body.appendChild(p);
-			}
-
-			// plot results
-			const WIDTH = 720;
-			const HEIGHT = 480;
-			const MARGIN = 10;
 			const c = document.getElementById("canvas");
-			c.width = WIDTH;
-			c.height = HEIGHT;
-			const ctx = c.getContext("2d");
+			cache_line_probe(
+				ab32,
+				(wip_results_y, wip_results_x) => {
+					plot_graph(c, wip_results_y, wip_results_x);
+				},
+				(cache_line_offset, cache_line_size_bytes, err) => {
+					let msg;
+					if (err) {
+						msg = err;
+					} else {
+						msg = "Cache line size: " + cache_line_size_bytes + " bytes. Cache line offset: " + cache_line_offset;
+					}
+					let p = document.createElement("p");
+					p.innerText = msg;
+					document.body.appendChild(p);
 
-			function redraw() {
-				ctx.fillStyle = "#fff";
-				ctx.fillRect(0, 0, c.width, c.height);
-				
-				let graph_top = Math.max(...results) * 1.1;
-				let threshold = (Math.min(...results) + Math.max(...results)) / 2;
-
-				for (let i = 0; i < num_groups; i++) {
-					ctx.fillStyle = results[i] > threshold ? "red" : "#fff";
-					let bar_height = results[i] / graph_top * (c.height - MARGIN * 2);
-					ctx.fillRect(
-						MARGIN + (c.width - MARGIN * 2) / num_groups * i,
-						c.height - MARGIN - bar_height,
-						(c.width - MARGIN * 2) / num_groups,
-						bar_height
+					const ab32_cache_aligned = new Uint32Array(ab, cache_line_offset, Math.floor((CACHE_LINE_SEARCH_SIZE - cache_line_offset) / Uint32Array.BYTES_PER_ELEMENT + 3));
+					cache_line_probe(
+						ab32_cache_aligned,
+						(wip_results_y, wip_results_x) => {
+							plot_graph(c, wip_results_y, wip_results_x);
+						},
+						(cache_line_offset, cache_line_size_bytes, err) => {
+							let msg;
+							if (err) {
+								msg = err;
+							} else {
+								msg = "Cache line size: " + cache_line_size_bytes + " bytes. Cache line offset: " + cache_line_offset;
+							}
+							let p = document.createElement("p");
+							p.innerText = msg;
+							document.body.appendChild(p);
+						}
 					);
-					ctx.strokeRect(
-						MARGIN + (c.width - MARGIN * 2) / num_groups * i,
-						c.height - MARGIN - bar_height,
-						(c.width - MARGIN * 2) / num_groups,
-						bar_height
-					);
 
-					ctx.fillStyle = "#000";
-					ctx.textAlign = "center";
-					ctx.fillText(i * 8, MARGIN + (c.width - MARGIN * 2) / num_groups * (i + 0.5), c.height - MARGIN - 10);
 				}
-			}
-
-			bench_step(0, 0);
+			);
 
 		</script>
 	</body>
