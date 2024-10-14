@@ -47,7 +47,7 @@ function cache_line_probe(ab32, progress_cb, done_cb)
 			if (repeats > 3) {
 				//alert("done");
 				let res = process_cache_line_search_results();
-				if (typeof myVar === "string") {
+				if (typeof res === "string") {
 					done_cb(null, null, res);
 				} else {
 					done_cb(res[0], res[1]);
@@ -61,7 +61,7 @@ function cache_line_probe(ab32, progress_cb, done_cb)
 		//console.log(offset, duration);
 
 		//plot_graph(c, results);
-		progress_cb(results, Array.from(results.keys().map(x=>x*8)));
+		progress_cb(results, Array.from(results.keys()).map(x=>x*8));
 
 		setTimeout(()=>bench_step(repeats, offset+1), 0); // yield
 	}
