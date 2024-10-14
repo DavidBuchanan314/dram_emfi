@@ -14,14 +14,16 @@
 				}
 			}
 
-			const ALLOC_SIZE = 512 * 0x100000; // 512MiB, exceed cache by some margin
+			const ALLOC_SIZE = 4 * 0x100000;
+			const CACHE_LINE_SEARCH_SIZE = 2 * 0x100000; // exceed L1 but not necessarily L2/L3
 			const MAX_DETECTABLE_CACHE_LINE_SIZE = 256; // in bytes
 
-			const ab = new ArrayBuffer(ALLOC_SIZE + 8); // we're going to assume this is at least 8-byte aligned, for efficient acces of 64-bit values.
-			const ab32 = new Uint32Array(ab);
+			const ab = new ArrayBuffer(ALLOC_SIZE); // we're going to assume this is at least 8-byte aligned, for efficient acces of 64-bit values.
+
+			const ab32 = new Uint32Array(ab, 0, CACHE_LINE_SEARCH_SIZE / Uint32Array.BYTES_PER_ELEMENT + 3);
 
 			const num_groups = MAX_DETECTABLE_CACHE_LINE_SIZE / 8; // each "lane" is 8 bytes wide
-			const num_steps = ALLOC_SIZE / 8 / num_groups;
+			const num_steps = CACHE_LINE_SEARCH_SIZE / 8 / num_groups;
 			let permutation = Array.from(Array(num_steps).keys()); // https://stackoverflow.com/a/33352604
 			shuffleArray(permutation);
 			permutation.push(permutation[0]);
@@ -50,39 +52,71 @@
 			}
 
 			// maybe warm up the JIT
-			for (let i=0; i<1000; i++) {
-				microbench(0, 100);
-			}
+			//for (let i=0; i<1000; i++) {
+			//	microbench(0, 100);
+			//}
 
-			let results = [];
+			let results = new Array(num_groups).fill(0);
 
-			for (let offset=0; offset < num_groups; offset++) {
-				let duration = microbench(offset, num_steps/8);
-				results.push(duration);
-				console.log(offset, duration);
+			function bench_step(repeats, offset)
+			{
+				if(offset >= num_groups) {
+					repeats += 1;
+					offset = 0;
+					if (repeats > 5) {
+						//alert("done");
+						return;
+					}
+				};
+				let duration = microbench(offset, num_steps*128);
+				//results.push(duration);
+				results[offset] = results[offset] == 0 ? duration : Math.min(results[offset], duration);
+				//console.log(offset, duration);
+
+				redraw();
+
+				setTimeout(()=>bench_step(repeats, offset+1), 0); // yield
 			}
 
 			// plot results
-			const WIDTH = 640;
+			const WIDTH = 720;
 			const HEIGHT = 480;
+			const MARGIN = 10;
 			const c = document.getElementById("canvas");
 			c.width = WIDTH;
 			c.height = HEIGHT;
 			const ctx = c.getContext("2d");
 
-			ctx.fillStyle = "#fff";
-			ctx.fillRect(0, 0, c.width, c.height);
-			
-			let graph_top = Math.max(...results) * 1.1;
+			function redraw() {
+				ctx.fillStyle = "#fff";
+				ctx.fillRect(0, 0, c.width, c.height);
+				
+				let graph_top = Math.max(...results) * 1.1;
+				let threshold = (Math.min(...results) + Math.max(...results)) / 2;
 
-			for (let i = 0; i < num_groups; i++) {
-				ctx.strokeRect(
-					c.width / num_groups * i,
-					c.height - 1 - results[i] / graph_top * c.height,
-					c.width / num_groups,
-					c.height - 1
-				);
+				for (let i = 0; i < num_groups; i++) {
+					ctx.fillStyle = results[i] > threshold ? "red" : "#fff";
+					let bar_height = results[i] / graph_top * (c.height - MARGIN * 2);
+					ctx.fillRect(
+						MARGIN + (c.width - MARGIN * 2) / num_groups * i,
+						c.height - MARGIN - bar_height,
+						(c.width - MARGIN * 2) / num_groups,
+						bar_height
+					);
+					ctx.strokeRect(
+						MARGIN + (c.width - MARGIN * 2) / num_groups * i,
+						c.height - MARGIN - bar_height,
+						(c.width - MARGIN * 2) / num_groups,
+						bar_height
+					);
+
+					ctx.fillStyle = "#000";
+					ctx.textAlign = "center";
+					ctx.fillText(i * 8, MARGIN + (c.width - MARGIN * 2) / num_groups * (i + 0.5), c.height - MARGIN - 10);
+				}
 			}
+
+			bench_step(0, 0);
 
 		</script>
 	</body>
