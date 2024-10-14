@@ -65,6 +65,7 @@
 					offset = 0;
 					if (repeats > 5) {
 						//alert("done");
+						process_cache_line_search_results();
 						return;
 					}
 				};
@@ -76,6 +77,34 @@
 				redraw();
 
 				setTimeout(()=>bench_step(repeats, offset+1), 0); // yield
+			}
+
+			function process_cache_line_search_results()
+			{
+				const threshold = (Math.min(...results) + Math.max(...results)) / 2;
+				let slow_result_indices = [];
+				for (let i in results) {
+					if (results[i] > threshold) {
+						slow_result_indices.push(1);
+					}
+				}
+				if (slow_result_indices.length & (slow_result_indices.length - 1)) { // if not a power of 2
+					console.log("Error: Failed to determine cache line size!");
+					return;
+				}
+				let spacing = results.length / slow_result_indices.length;
+				for (let i of slow_result_indices) {
+					if ((i % spacing) != (slow_result_indices[0] % spacing)) {
+						console.log("Error: Failed to determine cache line size!");
+						return;
+					}
+				}
+				let cache_line_size_bytes = spacing * 8;
+				msg = "Detected cache line size: " + cache_line_size_bytes + " bytes."
+				console.log(msg);
+				let p = document.createElement("p");
+				p.innerText = msg;
+				document.body.appendChild(p);
 			}
 
 			// plot results
