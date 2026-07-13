@@ -17,10 +17,12 @@ def enumerate_rw_pages(pid: int) -> List[int]:
 	pages = []
 	with open(f"/proc/{pid}/maps") as maps_file:
 		for line in maps_file.readlines():
-			start_hex, end_hex, perms = re.match(
+			match = re.match(
 				r"^([0-9a-f]+)\-([0-9a-f]+) (.{4}) ",
 				line
-			).groups()
+			)
+			assert match is not None
+			start_hex, end_hex, perms = match.groups()
 			if not perms.startswith("rw"):
 				continue
 			start, end = int(start_hex, 16), int(end_hex, 16)
