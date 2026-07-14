@@ -1,6 +1,6 @@
 #!/bin/sh
 # One-shot: boot alpine headlessly, wait for ssh, build+load the dropwrite LKM,
-# build+run the LKM-driven exploit (5s timeout), then kill qemu.
+# build+run the LKM-driven Dirty-Pagetable exploit (lpe_lkm.c), then kill qemu.
 #
 # The stale PTE corrupts kernel page-table accounting, so the guest is expected
 # to be unusable afterward -- that's why this boots a throwaway VM per attempt.
@@ -22,8 +22,11 @@ if ss -ltn 2>/dev/null | grep -q ":${SSH_PORT} "; then
 	exit 1
 fi
 
-# fully headless: no graphics, no serial, no monitor
-qemu-system-x86_64 -m 16384 -smp 16 -accel kvm -cpu host \
+# fully headless: no graphics, no serial, no monitor.
+# 512 MB / 2 CPUs: the grooming (PREFILL/FLUSH/spray budget in lpe_lkm.c) is
+# tuned for this small guest so movable memory is easy to exhaust; the exploit
+# also pins to CPU 1, so >=2 CPUs are required.
+qemu-system-x86_64 -m 512 -smp 2 -accel kvm -cpu host \
 	-hda alpine.qcow2 \
 	-device e1000,netdev=net0 -netdev user,id=net0,hostfwd=tcp::${SSH_PORT}-:22 \
 	-display none -serial none -monitor none &
@@ -51,14 +54,15 @@ ssh $SSHOPT $HOST '
 	gcc -O2 -Wall -o lpe_lkm lpe_lkm.c
 '
 
-echo "[*] running exploit (6s host-side timeout)..."
+echo "[*] running exploit (60s host-side timeout)..."
 set +e
 # Host-side timeout is the real bound: the stale PTE wedges the exploit in
 # uninterruptible kernel state on exit, so a guest-side `timeout` can't reap it
 # and the ssh would otherwise hang. NO pty (-tt): a pty buffers the exploit's
 # output and drops it when timeout kills ssh; piped stdout (exploit runs
 # unbuffered) is flushed line-by-line and survives the kill.
-timeout -k 2 6 ssh $SSHOPT $HOST '/root/lpe_lkm'
+# 60s: the grooming spray can take tens of seconds before it wins/exhausts.
+timeout -k 2 60 ssh $SSHOPT $HOST '/root/lpe_lkm'
 rc=$?
 [ $rc -ge 124 ] && echo "[*] exploit wedged on teardown (expected); ssh timed out (rc=$rc)"
 echo "[*] done (rc=$rc); killing qemu"

