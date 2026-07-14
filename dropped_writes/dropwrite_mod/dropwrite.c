@@ -224,6 +224,47 @@ static const struct file_operations arm_fops = {
 	.write = arm_write,
 };
 
+/*
+ * Oracle: report the live struct-page state of the freed PFN so grooming is
+ * observable. `probe_pfn` overrides which pfn to sample (0 => use last_pfn).
+ * Reading `state` samples it fresh each time.
+ */
+static u64 probe_pfn;
+
+static ssize_t state_read(struct file *f, char __user *ubuf, size_t len,
+			  loff_t *off)
+{
+	unsigned long pfn = READ_ONCE(probe_pfn);
+	struct page *pg;
+	char buf[256];
+	int n;
+
+	if (!pfn)
+		pfn = READ_ONCE(last_pfn);
+
+	if (!pfn || !pfn_valid(pfn)) {
+		n = scnprintf(buf, sizeof buf, "pfn=%lx invalid\n", pfn);
+		return simple_read_from_buffer(ubuf, len, off, buf, n);
+	}
+
+	pg = pfn_to_page(pfn);
+	/* page_count is safe on any valid page. PageBuddy/PageTable/PageSlab/
+	 * PageLRU are stable accessor macros over the page_type/flags union;
+	 * a free page reads count 0 + buddy=1, a reused pte-page reads table=1. */
+	n = scnprintf(buf, sizeof buf,
+		"pfn=%lx count=%d buddy=%d table=%d slab=%d lru=%d anon=%d "
+		"reserved=%d\n",
+		pfn, page_count(pg), PageBuddy(pg), PageTable(pg),
+		PageSlab(pg), PageLRU(pg), PageAnon(pg), PageReserved(pg));
+
+	return simple_read_from_buffer(ubuf, len, off, buf, n);
+}
+
+static const struct file_operations state_fops = {
+	.owner = THIS_MODULE,
+	.read  = state_read,
+};
+
 static int __init dw_init(void)
 {
 	int ret;
@@ -241,6 +282,8 @@ static int __init dw_init(void)
 	debugfs_create_u64("last_vaddr", 0444, ddir, &last_vaddr);
 	debugfs_create_u64("last_pfn", 0444, ddir, &last_pfn);
 	debugfs_create_u64("hits", 0444, ddir, &hits);
+	debugfs_create_u64("probe_pfn", 0644, ddir, &probe_pfn);
+	debugfs_create_file("state", 0444, ddir, NULL, &state_fops);
 
 	pr_info("loaded; kretprobe @ %p\n", dw_krp.kp.addr);
 	return 0;
