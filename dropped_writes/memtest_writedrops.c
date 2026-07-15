@@ -7,7 +7,7 @@
 // like datect_dropped_writes.py but in C
 
 #define FILLER_SIZE 0x10000  // smaller than LLC
-#define BUF_SIZE (128 * 0x100000)  // should exceed LLC
+#define BUF_SIZE (256 * 0x100000)  // should exceed LLC
 #define CL_SIZE 64
 
 int main()
@@ -34,10 +34,13 @@ int main()
             memcpy(buf+i, a, FILLER_SIZE);
         }
 
+	printf(".");
+	fflush(stdout);
+
         // Read back from the buffer, check it's what we expected
         for (off_t i = 0; i < BUF_SIZE; i += FILLER_SIZE) {
             if (memcmp(buf+i, a, FILLER_SIZE) != 0) {
-                printf("[*] GLITCH!\n");
+                printf("\n[*] GLITCH!\n");
                 for (off_t j = 0; j < FILLER_SIZE; j += CL_SIZE) {
                     if (memcmp(buf+i+j, b+j, CL_SIZE) == 0) {
                         printf("[+] DROPPED WRITE CONFIRMED at address %p\n", buf+i+j);
