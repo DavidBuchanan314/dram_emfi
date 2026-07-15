@@ -14,6 +14,8 @@ logging.basicConfig(level=logging.INFO)
 PAGE_SIZE = 0x1000
 CACHE_LINE_SIZE = 64
 
+ONLY_GLITCH_PTES = False
+
 def enumerate_rw_pages(pid: int) -> List[int]:
 	pages = []
 	with open(f"/proc/{pid}/maps") as maps_file:
@@ -59,11 +61,13 @@ def block_a_write(mem: BinaryIO, pages: List[int]) -> bool:
 			print("before: ", a[i:i+CACHE_LINE_SIZE].hex())
 			print("after:  ", b[i:i+CACHE_LINE_SIZE].hex())
 
-			if a[i] == 0x27 and b[i] == 0x27:  # looks like PTEs
-				print("reverting to 'before'")
-				mem.seek(page + i)
-				mem.write(a[i:i+CACHE_LINE_SIZE])
-				return True
+			if ONLY_GLITCH_PTES and (a[i] != 0x27 or b[i] != 0x27):  # very very naive looks-like-PTE heuristic
+				continue
+
+			print("reverting to 'before'")
+			mem.seek(page + i)
+			mem.write(a[i:i+CACHE_LINE_SIZE])
+			return True
 			#logger.info(f"Blocked a write at {hex(page+i)}")
 			
 			#time.sleep(0.01)
